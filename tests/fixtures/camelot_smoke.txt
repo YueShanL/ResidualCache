@@ -1,0 +1,18 @@
+Long-context language models must preserve useful evidence across successive
+windows. A memory reads historical key and value states before the current
+attention calculation. Only after that calculation may the current key and
+value states be written. This ordering prevents information from the current
+window from leaking into its own prediction.
+
+The baseline memory uses cosine similarity. Similar keys above a fixed
+threshold are consolidated with a count-weighted average. A novel key occupies
+an unused slot, or replaces the oldest slot when the memory is full.
+
+The probabilistic memory uses directional statistics to decide whether a key
+belongs to an existing slot. The slot is an index, while each write retains its
+original key and value as an individual record. Retrieval first routes to a
+small number of slots and then reranks their original records.
+
+Perplexity is computed on one-token-ahead targets while windows are processed
+sequentially. The native model cache is disabled, making external memory the
+only state carried from one window to the next.
