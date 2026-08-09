@@ -4,6 +4,7 @@ import json
 
 import pytest
 import torch
+import learnable_index.trainer as trainer_module
 
 from learnable_index.config import (
     AttentionAggregationConfig,
@@ -273,6 +274,47 @@ def test_small_training_run_writes_reproducible_artifacts(tmp_path):
     assert checkpoint["epoch"] in {1, 2}
     assert checkpoint["format_version"] == 2
     assert checkpoint["model_kind"] == "query_key_only"
+
+
+def test_training_stops_after_configured_non_improving_epochs(tmp_path, monkeypatch):
+    dataset = RetrievalDataset(
+        make_synthetic_samples(sample_count=12, residual_dim=4, min_blocks=2, max_blocks=3)
+    )
+
+    def constant_epoch(*args, **kwargs):
+        return {"loss": 1.0, "conditional_loss": 1.0}
+
+    monkeypatch.setattr(trainer_module, "_run_epoch", constant_epoch)
+    output_dir = tmp_path / "early_stop"
+    history = fit_router(
+        dataset,
+        output_dir,
+        RouterConfig(residual_dim=4, projection_dim=4, hidden_dim=8, depth=1),
+        LossConfig(),
+        TrainConfig(
+            epochs=10,
+            early_stopping_patience=2,
+            batch_size=4,
+            validation_fraction=0.25,
+            device="cpu",
+        ),
+    )
+
+    assert [row["epoch"] for row in history] == [1, 2, 3]
+    summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["epochs_completed"] == 3
+    assert summary["maximum_epochs"] == 10
+    assert summary["best_epoch"] == 1
+    assert summary["early_stopping_patience"] == 2
+    assert summary["stopped_early"] is True
+    _, _, _, stored_train_config, checkpoint = load_checkpoint(output_dir / "final.pt")
+    assert stored_train_config.early_stopping_patience == 2
+    assert checkpoint["epoch"] == 3
+
+
+def test_training_config_rejects_non_positive_early_stopping_patience():
+    with pytest.raises(ValueError, match="early_stopping_patience"):
+        TrainConfig(early_stopping_patience=0)
 
 
 def test_legacy_demand_checkpoint_loads_as_query_key_only(tmp_path):

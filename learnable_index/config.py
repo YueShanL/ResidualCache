@@ -65,6 +65,7 @@ class LossConfig:
 @dataclass(frozen=True)
 class TrainConfig:
     epochs: int = 20
+    early_stopping_patience: int | None = None
     batch_size: int = 32
     learning_rate: float = 3e-4
     weight_decay: float = 1e-4
@@ -78,6 +79,11 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.epochs <= 0 or self.batch_size <= 0:
             raise ValueError("epochs and batch_size must be positive")
+        if (
+            self.early_stopping_patience is not None
+            and self.early_stopping_patience <= 0
+        ):
+            raise ValueError("early_stopping_patience must be positive when set")
         if self.learning_rate <= 0 or self.weight_decay < 0:
             raise ValueError("invalid optimizer settings")
         if not 0 <= self.validation_fraction < 1:

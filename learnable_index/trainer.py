@@ -206,6 +206,9 @@ def fit_router(
 
     history: list[dict[str, Any]] = []
     best_value = float("inf")
+    best_epoch: int | None = None
+    epochs_without_improvement = 0
+    stopped_early = False
     metrics_path = output_dir / "metrics.jsonl"
     with metrics_path.open("w", encoding="utf-8", newline="\n") as metrics_handle:
         for epoch in range(1, train_config.epochs + 1):
@@ -235,6 +238,8 @@ def fit_router(
             monitored = validation_metrics.get("loss", train_metrics["loss"])
             if monitored < best_value:
                 best_value = monitored
+                best_epoch = epoch
+                epochs_without_improvement = 0
                 _save_checkpoint(
                     output_dir / "best.pt",
                     model,
@@ -245,7 +250,16 @@ def fit_router(
                     epoch,
                     row,
                 )
+            else:
+                epochs_without_improvement += 1
+            if (
+                train_config.early_stopping_patience is not None
+                and epochs_without_improvement >= train_config.early_stopping_patience
+            ):
+                stopped_early = True
+                break
 
+    final_epoch = int(history[-1]["epoch"])
     _save_checkpoint(
         output_dir / "final.pt",
         model,
@@ -253,13 +267,17 @@ def fit_router(
         router_config,
         loss_config,
         train_config,
-        train_config.epochs,
+        final_epoch,
         history[-1],
     )
     with (output_dir / "summary.json").open("w", encoding="utf-8", newline="\n") as handle:
         json.dump(
             {
-                "epochs_completed": train_config.epochs,
+                "epochs_completed": len(history),
+                "maximum_epochs": train_config.epochs,
+                "early_stopping_patience": train_config.early_stopping_patience,
+                "stopped_early": stopped_early,
+                "best_epoch": best_epoch,
                 "best_monitored_loss": best_value,
                 "final": history[-1],
                 "best_checkpoint": "best.pt",

@@ -42,7 +42,7 @@ PROJECT_DIR="/data/gpfs/projects/punim2072/LoRA_ICL_Analysis/ResidualCache"
 
 cd "$PROJECT_DIR"
 
-CONFIG_PATH="${1:-${PROJECT_DIR}/configs/learnable_index_wikitext1024_hpc.json}"
+CONFIG_PATH="${1:-${PROJECT_DIR}/configs/learnable_index_wikitext4096_hpc.json}"
 
 
 if [[ ! -f "${CONFIG_PATH}" ]]; then

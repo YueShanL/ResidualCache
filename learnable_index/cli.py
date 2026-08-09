@@ -37,6 +37,7 @@ def _build_parser() -> argparse.ArgumentParser:
     train.add_argument("--dropout", type=float, default=0.0)
     train.add_argument("--temperature", type=float, default=0.07)
     train.add_argument("--epochs", type=int, default=20)
+    train.add_argument("--early-stopping-patience", type=int)
     train.add_argument("--batch-size", type=int, default=32)
     train.add_argument("--learning-rate", type=float, default=3e-4)
     train.add_argument("--weight-decay", type=float, default=1e-4)
@@ -134,6 +135,7 @@ def _add_training_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--early-stopping-patience", type=int)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -276,6 +278,7 @@ def _train(arguments: argparse.Namespace) -> dict:
     loss_config = LossConfig()
     train_config = TrainConfig(
         epochs=arguments.epochs,
+        early_stopping_patience=arguments.early_stopping_patience,
         batch_size=arguments.batch_size,
         learning_rate=arguments.learning_rate,
         weight_decay=arguments.weight_decay,
@@ -381,6 +384,7 @@ def _run_real(arguments: argparse.Namespace) -> dict:
     )
     train_config = TrainConfig(
         epochs=arguments.epochs,
+        early_stopping_patience=arguments.early_stopping_patience,
         batch_size=arguments.batch_size,
         learning_rate=arguments.learning_rate,
         weight_decay=arguments.weight_decay,

@@ -56,6 +56,7 @@ def _config(tmp_path):
         },
         "training": {
             "epochs": 5,
+            "early_stopping_patience": 2,
             "batch_size": 32,
             "learning_rate": 3e-4,
             "weight_decay": 1e-4,
@@ -149,6 +150,7 @@ def test_train_and_replay_commands_are_query_key_only(tmp_path, monkeypatch):
     train_arguments = commands[0][1]
     replay_arguments = commands[1][1]
     assert commands[0][0] == "train"
+    assert train_arguments[train_arguments.index("--early-stopping-patience") + 1] == "2"
     assert "--demand-weight" not in train_arguments
     assert "--demand-loss" not in train_arguments
     assert commands[1][0] == "replay:test"
@@ -171,13 +173,43 @@ def test_hpc_config_rejects_absolute_model_and_dataset_paths(tmp_path, field):
 
 def test_fixed_slurm_script_directly_launches_runner_without_resubmission():
     project_root = Path(__file__).resolve().parents[1]
-    script = (project_root / "scripts" / "submit_learnable_index_hpc.sh").read_text(
+    script = (project_root / "scripts" / "submit_learnable_index_hpc.slurm").read_text(
         encoding="utf-8"
     )
 
     assert "#SBATCH --gres=gpu:1" in script
-    assert 'exec "${PYTHON_BIN}" -u' in script
     assert "run_learnable_index_hpc.py" in script
+    assert "learnable_index_wikitext4096_hpc.json" in script
     assert "exec sbatch" not in script
     assert "--print-sbatch-args" not in script
     assert "exec srun" not in script
+
+
+def test_wikitext4096_config_preserves_control_variables_and_full_replay():
+    project_root = Path(__file__).resolve().parents[1]
+    config = load_hpc_config(
+        project_root / "configs" / "learnable_index_wikitext4096_hpc.json"
+    )
+    validate_hpc_config(config)
+    pipeline = HPCPipeline(config)
+
+    assert config["data"]["splits"]["train"]["sequences"] == 4096
+    assert config["data"]["splits"]["validation"]["sequences"] == 59
+    assert config["data"]["splits"]["test"]["sequences"] == 58
+    assert pipeline._expected_samples("train") == 20_480
+    assert pipeline._expected_samples("validation") == 295
+    assert pipeline._expected_samples("test") == 290
+    assert config["training"]["validation_fraction"] == pytest.approx(0.1)
+    assert round(4096 * config["training"]["validation_fraction"]) == 410
+    assert config["training"]["epochs"] == 10
+    assert config["training"]["early_stopping_patience"] == 2
+    assert config["router"] == {
+        "projection_dim": 128,
+        "hidden_dim": 256,
+        "depth": 2,
+        "dropout": 0.1,
+        "temperature": 0.07,
+    }
+    assert config["training"]["learning_rate"] == pytest.approx(3e-4)
+    assert config["training"]["weight_decay"] == pytest.approx(1e-4)
+    assert config["replay"]["maximum_samples"] is None

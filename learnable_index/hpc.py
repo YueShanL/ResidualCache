@@ -75,6 +75,9 @@ def validate_hpc_config(config: dict[str, Any]) -> None:
         raise ValueError("data.dataset_config must be non-empty")
     if not 0 < float(config["training"]["validation_fraction"]) < 1:
         raise ValueError("training.validation_fraction must be strictly between 0 and 1")
+    patience = config["training"].get("early_stopping_patience")
+    if patience is not None and int(patience) <= 0:
+        raise ValueError("training.early_stopping_patience must be positive when set")
     if int(config["collection"].get("progress_every", 25)) < 0:
         raise ValueError("collection.progress_every must be non-negative")
 
@@ -342,44 +345,46 @@ class HPCPipeline:
             return
         router = self.config["router"]
         train = self.config["training"]
-        self._run_command(
+        arguments = [
+            "-m",
+            "learnable_index",
             "train",
-            [
-                "-m",
-                "learnable_index",
-                "train",
-                "--dataset-dir",
-                str(self._collection_dir("train") / "dataset"),
-                "--output-dir",
-                str(output),
-                "--projection-dim",
-                str(router["projection_dim"]),
-                "--hidden-dim",
-                str(router["hidden_dim"]),
-                "--depth",
-                str(router["depth"]),
-                "--dropout",
-                str(router["dropout"]),
-                "--temperature",
-                str(router["temperature"]),
-                "--epochs",
-                str(train["epochs"]),
-                "--batch-size",
-                str(train["batch_size"]),
-                "--learning-rate",
-                str(train["learning_rate"]),
-                "--weight-decay",
-                str(train["weight_decay"]),
-                "--validation-fraction",
-                str(train["validation_fraction"]),
-                "--top-n",
-                str(train["top_n"]),
-                "--seed",
-                str(self.config.get("seed", 13)),
-                "--device",
-                str(train["device"]),
-            ],
-        )
+            "--dataset-dir",
+            str(self._collection_dir("train") / "dataset"),
+            "--output-dir",
+            str(output),
+            "--projection-dim",
+            str(router["projection_dim"]),
+            "--hidden-dim",
+            str(router["hidden_dim"]),
+            "--depth",
+            str(router["depth"]),
+            "--dropout",
+            str(router["dropout"]),
+            "--temperature",
+            str(router["temperature"]),
+            "--epochs",
+            str(train["epochs"]),
+            "--batch-size",
+            str(train["batch_size"]),
+            "--learning-rate",
+            str(train["learning_rate"]),
+            "--weight-decay",
+            str(train["weight_decay"]),
+            "--validation-fraction",
+            str(train["validation_fraction"]),
+            "--top-n",
+            str(train["top_n"]),
+            "--seed",
+            str(self.config.get("seed", 13)),
+            "--device",
+            str(train["device"]),
+        ]
+        if train.get("early_stopping_patience") is not None:
+            arguments.extend(
+                ["--early-stopping-patience", str(train["early_stopping_patience"])]
+            )
+        self._run_command("train", arguments)
 
     def evaluate(self) -> None:
         if not self._enabled("evaluate"):
@@ -484,7 +489,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config",
         type=Path,
-        default=PROJECT_ROOT / "configs" / "learnable_index_wikitext1024_hpc.json",
+        default=PROJECT_ROOT / "configs" / "learnable_index_wikitext4096_hpc.json",
     )
     parser.add_argument("--validate-only", action="store_true")
     return parser

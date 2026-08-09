@@ -138,14 +138,17 @@ Run from `ResidualCache` with the parent repository environment:
 Training writes `run_config.json`, `metrics.jsonl`, `best.pt`, `final.pt`, and
 `summary.json`.  The run config records the information boundary explicitly.
 
-## Slurm/HPC run: WikiText-103, 1024 training documents
+## Slurm/HPC run: WikiText-103, 4096 training documents
 
 The HPC stage is driven by
-`configs/learnable_index_wikitext1024_hpc.json`. It prepares 1024 train
-articles plus independent WikiText validation/test articles, collects all
-three splits, trains with a sequence-grouped 10% holdout from the train split,
-evaluates the best checkpoint on the official validation/test splits, and
-replays 64 held-out test retrieval samples.
+`configs/learnable_index_wikitext4096_hpc.json`. It prepares 4096 train
+articles, yielding 20,480 retrieval samples at five retrieval points per
+article. Training uses a sequence-grouped 10% internal holdout (410 articles,
+2050 retrieval samples), a maximum of 10 epochs, and early stopping with
+patience 2. The independent official WikiText validation/test inputs remain at
+59/58 articles (295/290 retrieval samples), and replay covers all 290 official
+test samples. The earlier 1024-document JSON remains available as the
+single-variable baseline.
 
 The JSON uses Hugging Face repository IDs (`google/gemma-4-E4B-it` and
 `Salesforce/wikitext`) rather than model or dataset filesystem paths.
@@ -164,14 +167,14 @@ the model or dataset:
 
 ```bash
 "${PYTHON_BIN}" -m learnable_index.hpc \
-  --config configs/learnable_index_wikitext1024_hpc.json \
+  --config configs/learnable_index_wikitext4096_hpc.json \
   --validate-only
 ```
 
 Submit the fixed Slurm task directly:
 
 ```bash
-sbatch scripts/submit_learnable_index_hpc.sh
+sbatch scripts/submit_learnable_index_hpc.slurm
 ```
 
 The `#SBATCH` header is fixed in the task script; edit its partition/account or
