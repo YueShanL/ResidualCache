@@ -131,7 +131,9 @@ class RetrievalSample:
         if total > atol and abs(conditional_sum - 1.0) > atol:
             raise ValueError("conditional teacher distribution must sum to one")
         if total <= atol and conditional_sum > atol:
-            raise ValueError("zero-demand samples must have a zero conditional distribution")
+            raise ValueError(
+                "zero-historical-mass samples must have a zero conditional distribution"
+            )
         if self.per_future_teacher_block_mass is not None:
             per_future = self.per_future_teacher_block_mass
             if per_future.shape != (self.future_horizon_length, block_count):

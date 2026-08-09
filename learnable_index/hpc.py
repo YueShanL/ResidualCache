@@ -51,7 +51,6 @@ def validate_hpc_config(config: dict[str, Any]) -> None:
         "data",
         "collection",
         "router",
-        "loss",
         "training",
         "evaluation",
         "replay",
@@ -342,7 +341,6 @@ class HPCPipeline:
             self._emit("stage_skip", stage="train", reason="complete")
             return
         router = self.config["router"]
-        loss = self.config["loss"]
         train = self.config["training"]
         self._run_command(
             "train",
@@ -374,12 +372,6 @@ class HPCPipeline:
                 str(train["weight_decay"]),
                 "--validation-fraction",
                 str(train["validation_fraction"]),
-                "--conditional-weight",
-                str(loss["conditional_weight"]),
-                "--demand-weight",
-                str(loss["demand_weight"]),
-                "--demand-loss",
-                str(loss["demand_loss"]),
                 "--top-n",
                 str(train["top_n"]),
                 "--seed",
@@ -441,14 +433,8 @@ class HPCPipeline:
             str(replay["policy"]),
             "--replay-top-n",
             str(replay["top_n"]),
-            "--minimum-top-n",
-            str(replay["minimum_top_n"]),
-            "--maximum-top-n",
-            str(replay["maximum_top_n"]),
-            "--demand-threshold",
-            str(replay["demand_threshold"]),
-            "--cumulative-probability-target",
-            str(replay["cumulative_probability_target"]),
+            "--score-threshold",
+            str(replay.get("score_threshold", 0.0)),
             "--router-device",
             str(replay["router_device"]),
         ]

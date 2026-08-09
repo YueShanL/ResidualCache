@@ -75,13 +75,11 @@ def _run_epoch(
         batch_size = batch.query_summaries.shape[0]
         metrics.add("loss", loss.total.detach().repeat(batch_size).cpu())
         metrics.add("conditional_loss", loss.conditional.detach().repeat(batch_size).cpu())
-        metrics.add("demand_loss", loss.demand.detach().repeat(batch_size).cpu())
         update_router_metrics(
             metrics,
             output,
             batch,
             top_n=train_config.top_n,
-            demand_loss=loss_config.demand_loss,
         )
     return finite_metrics(metrics.compute())
 
@@ -119,7 +117,8 @@ def _save_checkpoint(
 ) -> None:
     torch.save(
         {
-            "format_version": 1,
+            "format_version": 2,
+            "model_kind": "query_key_only",
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "router_config": asdict(router_config),
@@ -141,13 +140,25 @@ def load_checkpoint(
         payload = torch.load(path, map_location=map_location, weights_only=True)
     except TypeError:
         payload = torch.load(path, map_location=map_location)
-    if int(payload.get("format_version", 0)) != 1:
+    format_version = int(payload.get("format_version", 0))
+    if format_version not in {1, 2}:
         raise ValueError("unsupported checkpoint format")
     router_config = RouterConfig(**payload["router_config"])
-    loss_config = LossConfig(**payload["loss_config"])
+    loss_config = LossConfig(
+        minimum_historical_mass=float(
+            payload.get("loss_config", {}).get("minimum_historical_mass", 1e-8)
+        )
+    )
     train_config = TrainConfig(**payload["train_config"])
     model = LearnableBlockIndex(router_config)
-    model.load_state_dict(payload["model_state_dict"])
+    state_dict = dict(payload["model_state_dict"])
+    if format_version == 1:
+        state_dict = {
+            name: value
+            for name, value in state_dict.items()
+            if not name.startswith("demand_head.")
+        }
+    model.load_state_dict(state_dict)
     return model, router_config, loss_config, train_config, payload
 
 

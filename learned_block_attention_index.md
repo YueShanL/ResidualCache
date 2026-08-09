@@ -322,6 +322,13 @@ scores, an explicit demand output, or an equivalent no-retrieval/local outcome.
 Whichever representation is chosen must preserve both `m_hist` and `p_i` in
 the saved labels and evaluation reports.
 
+Current staged implementation decision: train the query-key ranking network
+first and defer learned demand prediction. The dataset continues to retain
+`m_hist`, while the optimization target uses `p_i` only. Retrieval uses either
+a fixed Top-N budget or an explicitly configured threshold over query-key
+softmax probabilities. This isolates ranking quality before a demand model is
+designed and evaluated separately.
+
 ### Target aggregation remains configurable
 
 The first version uses attention probability, but the following reductions
@@ -344,7 +351,7 @@ For every retrieval sample, the router scores all candidate historical blocks
 used by that sample. The scores are trained against the teacher's soft
 block-attention target.
 
-The first version should report separate losses for:
+The complete design may report separate losses for:
 
 ```text
 conditional block-distribution prediction
@@ -356,7 +363,9 @@ conditional distribution. The exact loss for absolute historical mass depends
 on its chosen parameterization.
 
 Hard `top_n` is an inference policy and evaluation condition, not part of the
-first-version training graph.
+training graph. In the current query-key-only stage, conditional
+block-distribution prediction is the sole training loss; historical-demand
+prediction is deferred rather than implicitly approximated.
 
 ## Training Sample Contract
 
@@ -666,4 +675,3 @@ The following remain experiment or implementation decisions:
 - representation of total historical demand;
 - fixed versus dynamic inference policy;
 - the attention-output contribution metric used after the first version.
-

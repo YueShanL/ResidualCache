@@ -170,7 +170,7 @@ def test_kv_store_round_trip_merge_and_trim(tmp_path):
     assert trimmed[0][0].shape[2] == merged[0][0].shape[2] + 2
 
 
-def test_sparse_prefix_mask_and_dynamic_policy():
+def test_sparse_prefix_mask_and_manual_score_threshold_policy():
     bundle = fake_bundle()
     mask = build_sparse_prefix_mask(
         bundle,
@@ -187,14 +187,25 @@ def test_sparse_prefix_mask_and_dynamic_policy():
     decision = decide_retrieval(
         sample,
         torch.tensor([5.0, 1.0, 0.0]),
-        torch.tensor(5.0),
         RetrievalPolicyConfig(
-            policy="dynamic",
-            maximum_top_n=3,
-            cumulative_probability_target=0.8,
+            policy="score_threshold",
+            top_n=3,
+            score_threshold=0.8,
         ),
     )
     assert decision.selected_indices == (0,)
+
+    rejected = decide_retrieval(
+        sample,
+        torch.tensor([1.0, 1.0, 1.0]),
+        RetrievalPolicyConfig(
+            policy="score_threshold",
+            top_n=3,
+            score_threshold=0.5,
+        ),
+    )
+    assert rejected.selected_indices == ()
+    assert rejected.requested_top_n == 0
 
 
 def test_fake_gemma_collect_train_and_replay_end_to_end(tmp_path):

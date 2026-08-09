@@ -185,11 +185,10 @@ def test_masked_batch_and_router_ignore_padding_candidates():
     output = router(batch.query_summaries, batch.block_summaries, batch.candidate_mask)
 
     assert output.scores.shape == batch.candidate_mask.shape
-    assert output.demand_logits.shape == (2,)
     assert torch.all(output.scores[~batch.candidate_mask] < -1e20)
 
 
-def test_zero_demand_skips_conditional_loss_but_keeps_demand_loss():
+def test_zero_historical_mass_skips_conditional_ranking_loss():
     sample = make_synthetic_samples(sample_count=1, min_blocks=2, max_blocks=2)[0]
     sample.absolute_teacher_block_mass.zero_()
     sample.total_teacher_historical_mass.zero_()
@@ -201,10 +200,10 @@ def test_zero_demand_skips_conditional_loss_but_keeps_demand_loss():
 
     assert loss.conditional_sample_count == 0
     assert float(loss.conditional.detach()) == pytest.approx(0.0)
-    assert torch.isfinite(loss.demand)
+    assert torch.isfinite(loss.total)
 
 
-def test_mse_demand_loss_accepts_summed_attention_mass():
+def test_ranking_loss_accepts_summed_attention_mass():
     sample = make_synthetic_samples(sample_count=1, min_blocks=2, max_blocks=2)[0]
     sample.absolute_teacher_block_mass *= 3.0
     sample.total_teacher_historical_mass *= 3.0
@@ -212,7 +211,7 @@ def test_mse_demand_loss_accepts_summed_attention_mass():
     router = LearnableBlockIndex(RouterConfig(residual_dim=sample.residual_dim))
     output = router(batch.query_summaries, batch.block_summaries, batch.candidate_mask)
 
-    loss = router_loss(output, batch, LossConfig(demand_loss="mse"))
+    loss = router_loss(output, batch, LossConfig())
 
     assert torch.isfinite(loss.total)
 
@@ -272,3 +271,39 @@ def test_small_training_run_writes_reproducible_artifacts(tmp_path):
     assert isinstance(model, LearnableBlockIndex)
     assert router_config.residual_dim == 6
     assert checkpoint["epoch"] in {1, 2}
+    assert checkpoint["format_version"] == 2
+    assert checkpoint["model_kind"] == "query_key_only"
+
+
+def test_legacy_demand_checkpoint_loads_as_query_key_only(tmp_path):
+    config = RouterConfig(residual_dim=4, projection_dim=3, hidden_dim=5, depth=1)
+    model = LearnableBlockIndex(config)
+    legacy_path = tmp_path / "legacy.pt"
+    state_dict = dict(model.state_dict())
+    state_dict["demand_head.weight"] = torch.zeros(1, config.projection_dim)
+    state_dict["demand_head.bias"] = torch.zeros(1)
+    torch.save(
+        {
+            "format_version": 1,
+            "model_state_dict": state_dict,
+            "optimizer_state_dict": {},
+            "router_config": config.__dict__,
+            "loss_config": {
+                "conditional_weight": 1.0,
+                "demand_weight": 1.0,
+                "demand_loss": "bce",
+                "minimum_historical_mass": 1e-8,
+            },
+            "train_config": TrainConfig(epochs=1).__dict__,
+            "epoch": 1,
+            "metrics": {},
+        },
+        legacy_path,
+    )
+
+    loaded, _, loss_config, _, payload = load_checkpoint(legacy_path)
+
+    assert isinstance(loaded, LearnableBlockIndex)
+    assert not hasattr(loaded, "demand_head")
+    assert loss_config.minimum_historical_mass == pytest.approx(1e-8)
+    assert payload["format_version"] == 1

@@ -47,12 +47,39 @@ def _config(tmp_path):
             "maximum_candidate_blocks": 8,
             "progress_every": 25,
         },
-        "router": {},
-        "loss": {},
-        "training": {"validation_fraction": 0.1},
-        "evaluation": {},
-        "replay": {},
-        "stages": {},
+        "router": {
+            "projection_dim": 128,
+            "hidden_dim": 256,
+            "depth": 2,
+            "dropout": 0.1,
+            "temperature": 0.07,
+        },
+        "training": {
+            "epochs": 5,
+            "batch_size": 32,
+            "learning_rate": 3e-4,
+            "weight_decay": 1e-4,
+            "validation_fraction": 0.1,
+            "top_n": 4,
+            "device": "cuda",
+        },
+        "evaluation": {"top_n": 4, "device": "cuda"},
+        "replay": {
+            "enabled": True,
+            "split": "test",
+            "policy": "fixed",
+            "top_n": 4,
+            "score_threshold": 0.0,
+            "maximum_samples": 4,
+            "router_device": "cuda",
+        },
+        "stages": {
+            "prepare": True,
+            "collect": True,
+            "train": True,
+            "evaluate": True,
+            "replay": True,
+        },
     }
 
 
@@ -105,6 +132,29 @@ def test_prepare_stage_passes_hf_ids_directly_to_python_runner(tmp_path, monkeyp
         assert arguments[arguments.index("--tokenizer") + 1] == "google/gemma-4-E4B-it"
         assert "--arrow-dir" not in arguments
         assert "--allow-network" in arguments
+
+
+def test_train_and_replay_commands_are_query_key_only(tmp_path, monkeypatch):
+    pipeline = HPCPipeline(_config(tmp_path))
+    commands = []
+    monkeypatch.setattr(
+        pipeline,
+        "_run_command",
+        lambda stage, arguments: commands.append((stage, list(arguments))),
+    )
+
+    pipeline.train()
+    pipeline.replay()
+
+    train_arguments = commands[0][1]
+    replay_arguments = commands[1][1]
+    assert commands[0][0] == "train"
+    assert "--demand-weight" not in train_arguments
+    assert "--demand-loss" not in train_arguments
+    assert commands[1][0] == "replay:test"
+    assert replay_arguments[replay_arguments.index("--policy") + 1] == "fixed"
+    assert replay_arguments[replay_arguments.index("--score-threshold") + 1] == "0.0"
+    assert "--demand-threshold" not in replay_arguments
 
 
 @pytest.mark.parametrize("field", ["model", "dataset"])

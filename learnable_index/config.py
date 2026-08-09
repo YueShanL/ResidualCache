@@ -55,18 +55,9 @@ class RouterConfig:
 
 @dataclass(frozen=True)
 class LossConfig:
-    conditional_weight: float = 1.0
-    demand_weight: float = 1.0
-    demand_loss: Literal["bce", "mse"] = "bce"
     minimum_historical_mass: float = 1e-8
 
     def __post_init__(self) -> None:
-        if self.conditional_weight < 0 or self.demand_weight < 0:
-            raise ValueError("loss weights must be non-negative")
-        if self.conditional_weight + self.demand_weight <= 0:
-            raise ValueError("at least one loss weight must be positive")
-        if self.demand_loss not in {"bce", "mse"}:
-            raise ValueError("demand_loss must be 'bce' or 'mse'")
         if self.minimum_historical_mass < 0:
             raise ValueError("minimum_historical_mass must be non-negative")
 

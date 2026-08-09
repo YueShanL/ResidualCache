@@ -192,7 +192,7 @@ def evaluate_retrieval_replay(
         **collection_manifest["collection_config"]["student"]
     )
     student = RestrictedStudentCollector(bundle, student_config)
-    router, _, loss_config, _, checkpoint = load_checkpoint(checkpoint_path)
+    router, _, _, _, checkpoint = load_checkpoint(checkpoint_path)
     router_device = resolve_device(config.router_device)
     rows: list[dict[str, Any]] = []
 
@@ -229,7 +229,7 @@ def evaluate_retrieval_replay(
             dtype=torch.long,
         )
         router_start = time.perf_counter()
-        scores, demand_logit = score_retrieval_sample(
+        scores = score_retrieval_sample(
             router,
             sample,
             device=router_device,
@@ -237,9 +237,7 @@ def evaluate_retrieval_replay(
         decision = decide_retrieval(
             sample,
             scores,
-            demand_logit,
             config.policy,
-            demand_loss=loss_config.demand_loss,
         )
         router_latency = time.perf_counter() - router_start
         predicted_blocks = store.load_many(decision.selected_block_ids)

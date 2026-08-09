@@ -38,20 +38,18 @@ class IndexTower(nn.Module):
 @dataclass(frozen=True)
 class RouterOutput:
     scores: torch.Tensor
-    demand_logits: torch.Tensor
     query_embeddings: torch.Tensor
     key_embeddings: torch.Tensor
 
 
 class LearnableBlockIndex(nn.Module):
-    """Two-tower prompt-free block router with an explicit demand head."""
+    """Query-key two-tower block router without a learned demand head."""
 
     def __init__(self, config: RouterConfig) -> None:
         super().__init__()
         self.config = config
         self.query_network = IndexTower(config)
         self.key_network = IndexTower(config)
-        self.demand_head = nn.Linear(config.projection_dim, 1)
         self.logit_scale = nn.Parameter(
             torch.tensor(math.log(1.0 / config.initial_temperature), dtype=torch.float32)
         )
@@ -82,11 +80,8 @@ class LearnableBlockIndex(nn.Module):
         scale = self.logit_scale.exp().clamp(max=100.0)
         scores = torch.einsum("bd,bnd->bn", query_embeddings, key_embeddings) * scale
         scores = scores.masked_fill(~candidate_mask, torch.finfo(scores.dtype).min)
-        demand_logits = self.demand_head(query_embeddings).squeeze(-1)
         return RouterOutput(
             scores=scores,
-            demand_logits=demand_logits,
             query_embeddings=query_embeddings,
             key_embeddings=key_embeddings,
         )
-

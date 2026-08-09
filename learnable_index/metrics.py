@@ -39,7 +39,6 @@ def update_router_metrics(
     batch: RetrievalBatch,
     *,
     top_n: int,
-    demand_loss: str = "bce",
     epsilon: float = 1e-8,
 ) -> None:
     scores = output.scores
@@ -73,16 +72,6 @@ def update_router_metrics(
             predicted_indices = scores[row, :candidate_count].topk(budget).indices
             top_n_hits.append((predicted_indices == teacher_top[row]).any().float())
         accumulator.add(f"top{top_n}_teacher_block_recall", torch.stack(top_n_hits))
-
-    demand_prediction = (
-        output.demand_logits.sigmoid()
-        if demand_loss == "bce"
-        else F.softplus(output.demand_logits)
-    )
-    accumulator.add(
-        "historical_demand_mae",
-        (demand_prediction - batch.total_teacher_historical_mass).abs(),
-    )
 
     for row in range(scores.shape[0]):
         count = int(mask[row].sum().item())

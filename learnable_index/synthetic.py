@@ -33,8 +33,10 @@ def make_synthetic_samples(
         blocks = torch.randn(block_count, residual_dim, generator=generator)
         teacher_logits = blocks @ (teacher_map @ query) / residual_dim**0.5
         conditional = teacher_logits.softmax(dim=0)
-        demand = torch.sigmoid(0.8 * query[0] - 0.3 * query[1]).clamp(1e-4, 1 - 1e-4)
-        absolute = conditional * demand
+        historical_mass = torch.sigmoid(0.8 * query[0] - 0.3 * query[1]).clamp(
+            1e-4, 1 - 1e-4
+        )
+        absolute = conditional * historical_mass
 
         candidate_blocks = tuple(
             BlockRange(
@@ -60,7 +62,7 @@ def make_synthetic_samples(
                 query_summary=query,
                 block_summaries=blocks,
                 absolute_teacher_block_mass=absolute,
-                total_teacher_historical_mass=demand.reshape(()),
+                total_teacher_historical_mass=historical_mass.reshape(()),
                 conditional_teacher_distribution=conditional,
                 aggregation_metadata={
                     "source": "synthetic_smoke",
@@ -74,4 +76,3 @@ def make_synthetic_samples(
             ).validate()
         )
     return samples
-

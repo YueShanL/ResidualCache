@@ -41,9 +41,6 @@ def _build_parser() -> argparse.ArgumentParser:
     train.add_argument("--learning-rate", type=float, default=3e-4)
     train.add_argument("--weight-decay", type=float, default=1e-4)
     train.add_argument("--validation-fraction", type=float, default=0.2)
-    train.add_argument("--conditional-weight", type=float, default=1.0)
-    train.add_argument("--demand-weight", type=float, default=1.0)
-    train.add_argument("--demand-loss", choices=("bce", "mse"), default="bce")
     train.add_argument("--top-n", type=int, default=4)
     train.add_argument("--seed", type=int, default=13)
     train.add_argument("--device", default="auto")
@@ -64,7 +61,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     replay = subparsers.add_parser(
         "replay",
-        help="run fixed/dynamic retrieval and schedule-correct restricted replay",
+        help="run fixed/threshold retrieval and schedule-correct restricted replay",
     )
     _add_model_arguments(replay)
     replay.add_argument("--collection-dir", type=Path, required=True)
@@ -141,21 +138,17 @@ def _add_training_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--validation-fraction", type=float, default=0.2)
-    parser.add_argument("--conditional-weight", type=float, default=1.0)
-    parser.add_argument("--demand-weight", type=float, default=1.0)
-    parser.add_argument("--demand-loss", choices=("bce", "mse"), default="bce")
     parser.add_argument("--top-n", type=int, default=4)
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--train-device", default="auto")
 
 
 def _add_replay_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--policy", choices=("fixed", "dynamic"), default="fixed")
+    parser.add_argument(
+        "--policy", choices=("fixed", "score_threshold"), default="fixed"
+    )
     parser.add_argument("--replay-top-n", type=int, default=4)
-    parser.add_argument("--minimum-top-n", type=int, default=1)
-    parser.add_argument("--maximum-top-n", type=int, default=8)
-    parser.add_argument("--demand-threshold", type=float, default=0.05)
-    parser.add_argument("--cumulative-probability-target", type=float, default=0.8)
+    parser.add_argument("--score-threshold", type=float, default=0.0)
     parser.add_argument("--maximum-replay-samples", type=int)
     parser.add_argument("--router-device", default="cpu")
     parser.add_argument("--no-verify-query-summary", action="store_true")
@@ -243,10 +236,7 @@ def _replay_config(arguments: argparse.Namespace) -> ReplayConfig:
         policy=RetrievalPolicyConfig(
             policy=arguments.policy,
             top_n=arguments.replay_top_n,
-            minimum_top_n=arguments.minimum_top_n,
-            maximum_top_n=arguments.maximum_top_n,
-            demand_threshold=arguments.demand_threshold,
-            cumulative_probability_target=arguments.cumulative_probability_target,
+            score_threshold=arguments.score_threshold,
         ),
         maximum_samples=arguments.maximum_replay_samples,
         router_device=arguments.router_device,
@@ -283,11 +273,7 @@ def _train(arguments: argparse.Namespace) -> dict:
         dropout=arguments.dropout,
         initial_temperature=arguments.temperature,
     )
-    loss_config = LossConfig(
-        conditional_weight=arguments.conditional_weight,
-        demand_weight=arguments.demand_weight,
-        demand_loss=arguments.demand_loss,
-    )
+    loss_config = LossConfig()
     train_config = TrainConfig(
         epochs=arguments.epochs,
         batch_size=arguments.batch_size,
@@ -384,13 +370,7 @@ def _run_real(arguments: argparse.Namespace) -> dict:
         _collection_config(arguments),
         progress_callback=_collection_progress(arguments),
     )
-    loss_config = LossConfig(
-        conditional_weight=arguments.conditional_weight,
-        demand_weight=arguments.demand_weight,
-        demand_loss=arguments.demand_loss,
-    )
-    if arguments.future_reduction == "sum" and loss_config.demand_loss == "bce":
-        raise ValueError("future_reduction='sum' requires --demand-loss mse")
+    loss_config = LossConfig()
     router_config = RouterConfig(
         residual_dim=dataset.residual_dim,
         projection_dim=arguments.projection_dim,

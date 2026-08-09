@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
-  "run_id": "learnable_index_wikitext103_1024docs_v1",
+  "run_id": "learnable_index_wikitext103_1024docs_query_key_v1",
   "seed": 13,
   "paths": {
-    "output_root": "outputs/learnable_index_wikitext103_1024docs_v1"
+    "output_root": "outputs/learnable_index_wikitext103_1024docs_query_key_v1"
   },
   "model": {
     "name": "google/gemma-4-E4B-it",
@@ -60,11 +60,6 @@
     "dropout": 0.1,
     "temperature": 0.07
   },
-  "loss": {
-    "conditional_weight": 1.0,
-    "demand_weight": 1.0,
-    "demand_loss": "bce"
-  },
   "training": {
     "epochs": 20,
     "batch_size": 32,
@@ -83,10 +78,7 @@
     "split": "test",
     "policy": "fixed",
     "top_n": 4,
-    "minimum_top_n": 1,
-    "maximum_top_n": 8,
-    "demand_threshold": 0.05,
-    "cumulative_probability_target": 0.8,
+    "score_threshold": 0.0,
     "maximum_samples": 64,
     "router_device": "cuda"
   },

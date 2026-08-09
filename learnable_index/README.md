@@ -22,13 +22,13 @@ The pipeline provides:
 - strict local-window student query/block residual and complete physical KV
   collection, including Gemma 4 shared-KV metadata;
 - a versioned on-disk KV block store with model/config fingerprint checks;
-- separate query/key MLP towers and an explicit historical-demand head;
-- soft conditional cross-entropy plus demand calibration loss;
+- separate query/key MLP towers trained only with soft conditional
+  cross-entropy;
 - variable candidate counts through masked batching;
-- prediction KL/cross-entropy, top-1 recall, predicted/oracle coverage, entropy,
-  and historical-demand error;
+- prediction KL/cross-entropy, top-1 recall, predicted/oracle coverage, and
+  entropy;
 - checkpointed training/evaluation with a JSON run manifest;
-- fixed or demand/concentration-based dynamic top-N retrieval;
+- fixed Top-N or an explicit query-key probability-threshold policy;
 - schedule-correct teacher-forced replay for full context, local only,
   predicted, oracle, and recent-block conditions;
 - deterministic synthetic data for an offline end-to-end smoke test.
@@ -37,9 +37,9 @@ The language model remains frozen by construction. Teacher attention crosses
 the branch boundary only as labels; teacher residuals never enter router
 features. Router training is the only autograd-enabled model update.
 
-The default demand loss is BCE and expects mean-reduced historical attention
-mass in `[0, 1]`.  Experiments that sum attention across future tokens must use
-`--demand-loss mse`; the demand head then uses a non-negative softplus output.
+The current model deliberately has no learned retrieval-demand head. Absolute
+historical attention mass remains in the dataset contract so that conditional
+teacher distributions are well-defined, but it is not a prediction target.
 
 ## Dataset layout
 
@@ -100,9 +100,10 @@ The command is local-files-only by default. `--allow-network` is an explicit
 opt-in. Teacher attention requires eager attention and the loader rejects other
 backends/model families.
 
-For dynamic retrieval, use `--policy dynamic` with
-`--demand-threshold`, `--minimum-top-n`, `--maximum-top-n`, and
-`--cumulative-probability-target`.
+For a manually controlled budget, use fixed Top-N. For an explicit rule-based
+filter, use `--policy score_threshold --score-threshold P`; this keeps at most
+`--replay-top-n` blocks whose query-key softmax probability is at least `P`.
+No learned demand value participates in either policy.
 
 The output root contains `collection/`, `training/`, `replay/`, and
 `pipeline_manifest.json`. Replay records token predictions, NLL, KL from full
@@ -184,9 +185,8 @@ experiment config must use a different `output_root`.
 
 - Collection is teacher-forced; it does not synthesize autoregressive training
   trajectories.
-- Retrieval points follow a fixed mechanical interval. The dynamic policy can
-  skip retrieval and vary top-N, but does not yet reschedule the next retrieval
-  point.
+- Retrieval points follow a fixed mechanical interval. Fixed Top-N and manual
+  query-key score thresholds do not reschedule the next retrieval point.
 - Student collection uses local-only history without recurrently exposing
   previously retrieved blocks. Replay does expose selected blocks to future
   forwards and records this policy explicitly.
