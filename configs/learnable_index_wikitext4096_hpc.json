@@ -3,7 +3,9 @@
   "run_id": "learnable_index_wikitext103_4096docs_query_key_v1",
   "seed": 13,
   "paths": {
-    "output_root": "outputs/learnable_index_wikitext103_4096docs_query_key_v1"
+    "output_root": "outputs/learnable_index_wikitext103_4096docs_query_key_v1",
+    "use_tmp_workspace": true,
+    "tmp_workspace_root": "/tmp"
   },
   "model": {
     "name": "google/gemma-4-E4B-it",

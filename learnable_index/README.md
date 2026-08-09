@@ -150,6 +150,24 @@ patience 2. The independent official WikiText validation/test inputs remain at
 test samples. The earlier 1024-document JSON remains available as the
 single-variable baseline.
 
+The 4096-document config enables node-local temporary storage with:
+
+```json
+"paths": {
+  "output_root": "outputs/learnable_index_wikitext103_4096docs_query_key_v1",
+  "use_tmp_workspace": true,
+  "tmp_workspace_root": "/tmp"
+}
+```
+
+When enabled, prepared inputs, aligned datasets, checkpoints, evaluation,
+replay, and Hugging Face/Datasets/Torch caches are placed below the configured
+temporary root. Only `training/best.pt`, `training/metrics.jsonl`, and
+`training/summary.json` are copied atomically to `output_root` after every
+stage succeeds. Change `tmp_workspace_root` to another absolute node-local
+scratch path when required. Temporary mode intentionally does not resume data
+collection across jobs because node-local storage is ephemeral.
+
 The JSON uses Hugging Face repository IDs (`google/gemma-4-E4B-it` and
 `Salesforce/wikitext`) rather than model or dataset filesystem paths.
 Transformers and Datasets use their normal Hugging Face cache. Optionally set

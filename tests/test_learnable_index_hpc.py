@@ -213,3 +213,51 @@ def test_wikitext4096_config_preserves_control_variables_and_full_replay():
     assert config["training"]["learning_rate"] == pytest.approx(3e-4)
     assert config["training"]["weight_decay"] == pytest.approx(1e-4)
     assert config["replay"]["maximum_samples"] is None
+    assert config["paths"]["use_tmp_workspace"] is True
+    assert config["paths"]["tmp_workspace_root"] == "/tmp"
+
+
+def test_tmp_workspace_exports_only_best_model_and_training_metrics(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    config["_config_path"] = str(tmp_path / "config.json")
+    config["paths"]["use_tmp_workspace"] = True
+    config["paths"]["tmp_workspace_root"] = str(tmp_path / "node-local")
+    monkeypatch.setenv("SLURM_JOB_ID", "12345")
+    pipeline = HPCPipeline(config)
+
+    assert pipeline.output_root.parent.parent == (tmp_path / "node-local").resolve()
+    assert pipeline.persistent_output_root == (tmp_path / "output").resolve()
+    assert pipeline.environment["HF_HOME"].startswith(str(pipeline.output_root))
+    assert pipeline.environment["HF_DATASETS_CACHE"].startswith(
+        str(pipeline.output_root)
+    )
+    pipeline._initialize()
+    assert not pipeline.persistent_output_root.exists()
+
+    training = pipeline.output_root / "training"
+    training.mkdir(parents=True)
+    (training / "best.pt").write_bytes(b"checkpoint")
+    (training / "metrics.jsonl").write_text('{"epoch": 1}\n', encoding="utf-8")
+    (training / "summary.json").write_text('{"best_epoch": 1}\n', encoding="utf-8")
+    (training / "final.pt").write_bytes(b"not exported")
+    pipeline._export_training_artifacts()
+
+    exported = {
+        path.relative_to(pipeline.persistent_output_root).as_posix()
+        for path in pipeline.persistent_output_root.rglob("*")
+        if path.is_file()
+    }
+    assert exported == {
+        "training/best.pt",
+        "training/metrics.jsonl",
+        "training/summary.json",
+    }
+
+
+def test_tmp_workspace_root_must_be_absolute(tmp_path):
+    config = _config(tmp_path)
+    config["paths"]["use_tmp_workspace"] = True
+    config["paths"]["tmp_workspace_root"] = "relative/scratch"
+
+    with pytest.raises(ValueError, match="must be an absolute path"):
+        validate_hpc_config(config)

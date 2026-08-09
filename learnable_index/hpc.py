@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from typing import Any, Iterable
@@ -13,6 +14,8 @@ from typing import Any, Iterable
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REQUIRED_SPLITS = ("train", "validation", "test")
+DEFAULT_TMP_WORKSPACE_ROOT = "/tmp"
+EXPORTED_TRAINING_ARTIFACTS = ("best.pt", "metrics.jsonl", "summary.json")
 
 
 def load_hpc_config(path: Path | str) -> dict[str, Any]:
@@ -80,6 +83,35 @@ def validate_hpc_config(config: dict[str, Any]) -> None:
         raise ValueError("training.early_stopping_patience must be positive when set")
     if int(config["collection"].get("progress_every", 25)) < 0:
         raise ValueError("collection.progress_every must be non-negative")
+    if not isinstance(config["paths"].get("use_tmp_workspace", False), bool):
+        raise ValueError("paths.use_tmp_workspace must be a boolean")
+    temporary_root = str(
+        config["paths"].get("tmp_workspace_root", DEFAULT_TMP_WORKSPACE_ROOT)
+    ).strip()
+    if not temporary_root:
+        raise ValueError("paths.tmp_workspace_root must be non-empty")
+    if not (temporary_root.startswith("/") or Path(temporary_root).is_absolute()):
+        raise ValueError("paths.tmp_workspace_root must be an absolute path")
+
+
+def _temporary_output_path(config: dict[str, Any]) -> Path:
+    run_id = "".join(
+        character if character.isalnum() or character in {"-", "_"} else "_"
+        for character in str(config["run_id"])
+    ).strip("_")
+    if not run_id:
+        raise ValueError("run_id must contain at least one filesystem-safe character")
+    job_id = os.environ.get("SLURM_JOB_ID") or f"pid-{os.getpid()}"
+    array_id = os.environ.get("SLURM_ARRAY_TASK_ID")
+    task_id = f"{job_id}-{array_id}" if array_id is not None else job_id
+    temporary_root = Path(
+        config["paths"].get("tmp_workspace_root", DEFAULT_TMP_WORKSPACE_ROOT)
+    )
+    return (
+        temporary_root
+        / "residualcache_learnable_index"
+        / f"{run_id}-{task_id}"
+    ).resolve()
 
 
 def _fingerprint(config: dict[str, Any]) -> str:
@@ -100,7 +132,13 @@ class HPCPipeline:
     def __init__(self, config: dict[str, Any]) -> None:
         validate_hpc_config(config)
         self.config = config
-        self.output_root = _output_path(config)
+        self.persistent_output_root = _output_path(config)
+        self.use_tmp_workspace = bool(config["paths"].get("use_tmp_workspace", False))
+        self.output_root = (
+            _temporary_output_path(config)
+            if self.use_tmp_workspace
+            else self.persistent_output_root
+        )
         self.fingerprint = _fingerprint(config)
         self.environment = os.environ.copy()
         self.environment.update(
@@ -114,6 +152,18 @@ class HPCPipeline:
         self.environment["PYTHONPATH"] = os.pathsep.join(
             part for part in (str(PROJECT_ROOT), current_pythonpath) if part
         )
+        if self.use_tmp_workspace:
+            cache_root = self.output_root / "cache"
+            huggingface_root = cache_root / "huggingface"
+            self.environment.update(
+                {
+                    "HF_HOME": str(huggingface_root),
+                    "HF_HUB_CACHE": str(huggingface_root / "hub"),
+                    "HF_DATASETS_CACHE": str(huggingface_root / "datasets"),
+                    "TORCH_HOME": str(cache_root / "torch"),
+                    "XDG_CACHE_HOME": str(cache_root),
+                }
+            )
 
     def _emit(self, event: str, **fields: Any) -> None:
         row = {"time": _utc_now(), "event": event, **fields}
@@ -125,6 +175,21 @@ class HPCPipeline:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     def _initialize(self) -> None:
+        if self.use_tmp_workspace and self.persistent_output_root.exists():
+            allowed = {
+                self.persistent_output_root / "training" / name
+                for name in EXPORTED_TRAINING_ARTIFACTS
+            }
+            unexpected = [
+                path
+                for path in self.persistent_output_root.rglob("*")
+                if path.is_file() and path not in allowed
+            ]
+            if unexpected:
+                raise RuntimeError(
+                    "temporary-workspace destination contains non-export artifacts: "
+                    + ", ".join(str(path) for path in unexpected[:5])
+                )
         self.output_root.mkdir(parents=True, exist_ok=True)
         path = self.output_root / "resolved_config.json"
         payload = {
@@ -145,6 +210,24 @@ class HPCPipeline:
                 json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
+
+    def _export_training_artifacts(self) -> None:
+        if not self.use_tmp_workspace:
+            return
+        source = self.output_root / "training"
+        missing = [name for name in EXPORTED_TRAINING_ARTIFACTS if not (source / name).is_file()]
+        if missing:
+            raise RuntimeError(
+                "cannot export incomplete training artifacts: " + ", ".join(missing)
+            )
+        destination = self.persistent_output_root / "training"
+        destination.mkdir(parents=True, exist_ok=True)
+        for name in EXPORTED_TRAINING_ARTIFACTS:
+            target = destination / name
+            staging = destination / f".{name}.tmp-{os.getpid()}"
+            shutil.copy2(source / name, staging)
+            os.replace(staging, target)
+            self._emit("artifact_exported", artifact=name, destination=str(target))
 
     def _run_command(self, stage: str, arguments: Iterable[str]) -> None:
         command = [sys.executable, "-u", *map(str, arguments)]
@@ -475,7 +558,10 @@ class HPCPipeline:
             json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+        self._export_training_artifacts()
         self._emit("pipeline_complete", manifest="hpc_pipeline_manifest.json")
+        if self.use_tmp_workspace:
+            shutil.rmtree(self.output_root)
 
 
 def _index_specification(value: Any) -> str:
@@ -509,6 +595,14 @@ def main(argv: list[str] | None = None) -> int:
                     "dataset_name": config["data"]["dataset_name"],
                     "dataset_config": config["data"]["dataset_config"],
                     "output_root": str(_output_path(config)),
+                    "use_tmp_workspace": bool(
+                        config["paths"].get("use_tmp_workspace", False)
+                    ),
+                    "tmp_workspace_root": str(
+                        config["paths"].get(
+                            "tmp_workspace_root", DEFAULT_TMP_WORKSPACE_ROOT
+                        )
+                    ),
                 },
                 ensure_ascii=False,
                 indent=2,
