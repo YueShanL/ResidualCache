@@ -201,6 +201,7 @@ def test_fake_gemma_collect_train_and_replay_end_to_end(tmp_path):
     bundle = fake_bundle()
     record = SequenceRecord("sequence-1", tuple(range(1, 15)), {"kind": "fake"})
     collection_dir = tmp_path / "collection"
+    progress = []
     dataset, manifest = collect_aligned_dataset(
         bundle,
         [record],
@@ -220,9 +221,11 @@ def test_fake_gemma_collect_train_and_replay_end_to_end(tmp_path):
             ),
             attention=AttentionAggregationConfig(future_reduction="mean"),
         ),
+        progress_callback=progress.append,
     )
     assert len(dataset) >= 2
     assert manifest["kv_block_count"] >= 1
+    assert progress[-1]["completed"] == progress[-1]["total"] == len(dataset)
     assert dataset[0].per_future_teacher_block_mass.shape == (
         dataset[0].future_horizon_length,
         len(dataset[0].candidate_blocks),

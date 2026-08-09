@@ -21,9 +21,89 @@ from learnable_index.data import (
 )
 from learnable_index.losses import router_loss
 from learnable_index.model import LearnableBlockIndex
+from learnable_index.prepare_wikitext import (
+    _iter_arrow_texts,
+    _iter_hf_texts,
+    build_wikitext_sequences,
+    iter_wikitext_articles,
+)
 from learnable_index.synthetic import make_synthetic_samples
 from learnable_index.targets import aggregate_teacher_attention
 from learnable_index.trainer import fit_router, load_checkpoint
+
+
+class _WhitespaceTokenizer:
+    def __call__(self, text, *, add_special_tokens):
+        assert add_special_tokens is True
+        tokens = [101]
+        tokens.extend(range(200, 200 + len(text.split())))
+        return type("Encoding", (), {"input_ids": tokens})()
+
+
+def test_wikitext_arrow_reader_projects_text_column(tmp_path):
+    import pyarrow as pa
+
+    path = tmp_path / "wikitext-train.arrow"
+    schema = pa.schema([("text", pa.string()), ("unused", pa.int64())])
+    with pa.OSFile(str(path), "wb") as sink:
+        with pa.ipc.new_stream(sink, schema) as writer:
+            writer.write_batch(
+                pa.record_batch(
+                    [pa.array(["first", "second"]), pa.array([1, 2])],
+                    schema=schema,
+                )
+            )
+
+    assert list(_iter_arrow_texts([path])) == ["first", "second"]
+
+
+def test_wikitext_hf_reader_iterates_text_batches_without_materializing_split():
+    class FakeDataset:
+        column_names = ["text", "unused"]
+
+        def iter(self, *, batch_size):
+            assert batch_size == 2
+            yield {"text": ["first", "second"], "unused": [1, 2]}
+            yield {"text": ["third"], "unused": [3]}
+
+    assert list(_iter_hf_texts(FakeDataset(), batch_size=2)) == [
+        "first",
+        "second",
+        "third",
+    ]
+
+
+def test_wikitext_preparation_preserves_article_boundaries_and_exact_length():
+    rows = [
+        "orphan preamble\n",
+        " = First article = \n",
+        "one two three four five six\n",
+        " = = Subheading = = \n",
+        "seven eight\n",
+        " = Second article = \n",
+        "alpha beta gamma delta epsilon zeta eta theta\n",
+    ]
+    articles = list(iter_wikitext_articles(rows))
+    assert [(article.article_index, article.title) for article in articles] == [
+        (0, "First article"),
+        (1, "Second article"),
+    ]
+    assert "Subheading" in articles[0].text
+    assert "Second article" not in articles[0].text
+
+    records = build_wikitext_sequences(
+        articles,
+        _WhitespaceTokenizer(),
+        sequence_length=6,
+        sequence_count=2,
+        article_stride=1,
+        seed=13,
+        split="validation",
+    )
+    assert len(records) == 2
+    assert all(len(record["token_ids"]) == 6 for record in records)
+    assert len({record["article_index"] for record in records}) == 2
+    assert all("-validation-" in record["sequence_id"] for record in records)
 
 
 def test_teacher_attention_aggregation_preserves_absolute_and_conditional_mass():

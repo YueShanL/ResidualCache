@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Callable, Iterable
 
 import torch
 
@@ -86,6 +86,7 @@ def collect_aligned_dataset(
     records: Iterable[SequenceRecord],
     output_dir: Path | str,
     config: AlignedCollectionConfig,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[RetrievalDataset, dict]:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -94,10 +95,13 @@ def collect_aligned_dataset(
     store = KVBlockStore(output_dir / "kv_store")
     teacher = TeacherAttentionCollector(bundle, config.attention)
     student = RestrictedStudentCollector(bundle, config.student)
+    record_plans = [
+        (record, build_retrieval_plans(record, config.plan)) for record in record_list
+    ]
+    total_plans = sum(len(plans) for _, plans in record_plans)
     samples = []
     plan_rows = []
-    for record in record_list:
-        plans = build_retrieval_plans(record, config.plan)
+    for record, plans in record_plans:
         for plan in plans:
             blocks = student.ensure_blocks(record, plan, store)
             query_summary = student.collect_query(record, plan)
@@ -112,6 +116,15 @@ def collect_aligned_dataset(
                 )
             )
             plan_rows.append(_plan_payload(plan))
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "completed": len(samples),
+                        "total": total_plans,
+                        "sequence_id": record.sequence_id,
+                        "sample_id": plan.sample_id,
+                    }
+                )
     if not samples:
         raise ValueError("collection produced no retrieval samples; sequence or plan is too short")
     with (output_dir / "plans.jsonl").open("w", encoding="utf-8", newline="\n") as handle:

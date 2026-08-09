@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "run_id": "learnable_index_wikitext103_1024docs_v1",
+  "seed": 13,
+  "paths": {
+    "output_root": "outputs/learnable_index_wikitext103_1024docs_v1"
+  },
+  "model": {
+    "name": "google/gemma-4-E4B-it",
+    "device": "cuda",
+    "dtype": "bfloat16",
+    "allow_network": true
+  },
+  "data": {
+    "dataset_name": "Salesforce/wikitext",
+    "dataset_config": "wikitext-103-raw-v1",
+    "cache_dir": null,
+    "allow_network": true,
+    "sequence_length": 1024,
+    "one_sequence_per_article": true,
+    "splits": {
+      "train": {
+        "sequences": 1024,
+        "article_stride": 19
+      },
+      "validation": {
+        "sequences": 59,
+        "article_stride": 1
+      },
+      "test": {
+        "sequences": 58,
+        "article_stride": 1
+      }
+    }
+  },
+  "collection": {
+    "local_context_length": 256,
+    "block_size": 64,
+    "future_horizon": 16,
+    "retrieval_interval": 128,
+    "minimum_candidate_blocks": 2,
+    "maximum_candidate_blocks": 8,
+    "residual_layer": 40,
+    "query_summary": "mean",
+    "query_summary_length": 16,
+    "teacher_layers": [
+      29,
+      35,
+      41
+    ],
+    "teacher_heads": "all",
+    "future_reduction": "mean",
+    "length_normalize_blocks": false,
+    "progress_every": 25
+  },
+  "router": {
+    "projection_dim": 128,
+    "hidden_dim": 256,
+    "depth": 2,
+    "dropout": 0.1,
+    "temperature": 0.07
+  },
+  "loss": {
+    "conditional_weight": 1.0,
+    "demand_weight": 1.0,
+    "demand_loss": "bce"
+  },
+  "training": {
+    "epochs": 20,
+    "batch_size": 32,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.0001,
+    "validation_fraction": 0.1,
+    "top_n": 4,
+    "device": "cuda"
+  },
+  "evaluation": {
+    "top_n": 4,
+    "device": "cuda"
+  },
+  "replay": {
+    "enabled": true,
+    "split": "test",
+    "policy": "fixed",
+    "top_n": 4,
+    "minimum_top_n": 1,
+    "maximum_top_n": 8,
+    "demand_threshold": 0.05,
+    "cumulative_probability_target": 0.8,
+    "maximum_samples": 64,
+    "router_device": "cuda"
+  },
+  "stages": {
+    "prepare": true,
+    "collect": true,
+    "train": true,
+    "evaluate": true,
+    "replay": true
+  }
+}

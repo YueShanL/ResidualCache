@@ -122,6 +122,12 @@ def _add_collection_arguments(
     parser.add_argument("--teacher-heads", default="all")
     parser.add_argument("--future-reduction", choices=("mean", "sum"), default="mean")
     parser.add_argument("--length-normalize-blocks", action="store_true")
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=25,
+        help="emit collection progress every N retrieval samples; 0 disables it",
+    )
 
 
 def _add_training_arguments(parser: argparse.ArgumentParser) -> None:
@@ -208,6 +214,28 @@ def _collection_config(arguments: argparse.Namespace) -> AlignedCollectionConfig
             length_normalize_blocks=arguments.length_normalize_blocks,
         ),
     )
+
+
+def _collection_progress(arguments: argparse.Namespace):
+    every = int(arguments.progress_every)
+    if every < 0:
+        raise ValueError("progress_every must be non-negative")
+    if every == 0:
+        return None
+
+    def report(event: dict) -> None:
+        completed = int(event["completed"])
+        total = int(event["total"])
+        if completed == 1 or completed == total or completed % every == 0:
+            print(
+                json.dumps(
+                    {"event": "collection_progress", **event},
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+
+    return report
 
 
 def _replay_config(arguments: argparse.Namespace) -> ReplayConfig:
@@ -321,6 +349,7 @@ def _collect(arguments: argparse.Namespace) -> dict:
         records,
         arguments.output_dir,
         _collection_config(arguments),
+        progress_callback=_collection_progress(arguments),
     )
     return manifest
 
@@ -353,6 +382,7 @@ def _run_real(arguments: argparse.Namespace) -> dict:
         records,
         collection_dir,
         _collection_config(arguments),
+        progress_callback=_collection_progress(arguments),
     )
     loss_config = LossConfig(
         conditional_weight=arguments.conditional_weight,

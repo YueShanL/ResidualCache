@@ -137,6 +137,49 @@ Run from `ResidualCache` with the parent repository environment:
 Training writes `run_config.json`, `metrics.jsonl`, `best.pt`, `final.pt`, and
 `summary.json`.  The run config records the information boundary explicitly.
 
+## Slurm/HPC run: WikiText-103, 1024 training documents
+
+The HPC stage is driven by
+`configs/learnable_index_wikitext1024_hpc.json`. It prepares 1024 train
+articles plus independent WikiText validation/test articles, collects all
+three splits, trains with a sequence-grouped 10% holdout from the train split,
+evaluates the best checkpoint on the official validation/test splits, and
+replays 64 held-out test retrieval samples.
+
+The JSON uses Hugging Face repository IDs (`google/gemma-4-E4B-it` and
+`Salesforce/wikitext`) rather than model or dataset filesystem paths.
+Transformers and Datasets use their normal Hugging Face cache. Optionally set
+the cache root and authentication in the job environment:
+
+```bash
+export HF_HOME=/path/to/huggingface/cache
+export HF_TOKEN=your_read_token
+export PYTHON_BIN=/path/to/venv/bin/python
+```
+
+`HF_TOKEN` is needed when the model repository requires accepted terms or
+authentication. Validation checks only the JSON contract and does not download
+the model or dataset:
+
+```bash
+"${PYTHON_BIN}" -m learnable_index.hpc \
+  --config configs/learnable_index_wikitext1024_hpc.json \
+  --validate-only
+```
+
+Submit the fixed Slurm task directly:
+
+```bash
+sbatch scripts/submit_learnable_index_hpc.sh
+```
+
+The `#SBATCH` header is fixed in the task script; edit its partition/account or
+add cluster-specific `module load` lines there if required. The script directly
+starts `scripts/run_learnable_index_hpc.py`; it does not generate or recursively
+submit another job. An alternative JSON file may be passed as the first script
+argument. Completed stages are validated and skipped on resubmission; a changed
+experiment config must use a different `output_root`.
+
 ## Current research boundary
 
 - Collection is teacher-forced; it does not synthesize autoregressive training
