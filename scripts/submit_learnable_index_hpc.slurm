@@ -17,6 +17,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
+#SBATCH --tmp=128GB
 #SBATCH --time=48:00:00
 
 # Use this email address:
