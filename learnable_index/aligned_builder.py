@@ -26,10 +26,14 @@ class AlignedCollectionConfig:
     plan: PlanConfig = PlanConfig()
     student: StudentCollectionConfig = StudentCollectionConfig()
     attention: AttentionAggregationConfig = AttentionAggregationConfig()
+    teacher_prefill_chunk_size: int | None = None
+    store_kv_payload: bool = True
 
     def __post_init__(self) -> None:
         if self.plan.local_context_length != self.student.local_context_length:
             raise ValueError("plan and student local context lengths must match")
+        if self.teacher_prefill_chunk_size is not None and self.teacher_prefill_chunk_size <= 0:
+            raise ValueError("teacher_prefill_chunk_size must be positive when set")
 
 
 def _save_sequences(root: Path, records: list[SequenceRecord]) -> None:
@@ -93,7 +97,11 @@ def collect_aligned_dataset(
     record_list = list(records)
     _save_sequences(output_dir, record_list)
     store = KVBlockStore(output_dir / "kv_store")
-    teacher = TeacherAttentionCollector(bundle, config.attention)
+    teacher = TeacherAttentionCollector(
+        bundle,
+        config.attention,
+        prefill_chunk_size=config.teacher_prefill_chunk_size,
+    )
     student = RestrictedStudentCollector(bundle, config.student)
     record_plans = [
         (record, build_retrieval_plans(record, config.plan)) for record in record_list
@@ -103,7 +111,12 @@ def collect_aligned_dataset(
     plan_rows = []
     for record, plans in record_plans:
         for plan in plans:
-            blocks = student.ensure_blocks(record, plan, store)
+            blocks = student.ensure_blocks(
+                record,
+                plan,
+                store,
+                persist=config.store_kv_payload,
+            )
             query_summary = student.collect_query(record, plan)
             target = teacher.collect(record, plan)
             samples.append(
@@ -152,6 +165,7 @@ def collect_aligned_dataset(
         "sequence_count": len(record_list),
         "sample_count": len(samples),
         "kv_block_count": len(store.manifest["blocks"]),
+        "kv_payload_stored": config.store_kv_payload,
         "dataset_dir": "dataset",
         "kv_store_dir": "kv_store",
         "student_memory_policy": "local_only_no_recurrent_retrieval_during_collection",

@@ -620,6 +620,41 @@ The following are accepted properties of the design, not reasons to reject it:
 - The teacher's supported full-context length bounds the directly supervised
   horizon available during training.
 
+## Controlled long-distance ConvoMem stage
+
+Natural WikiText order makes relevance and distance correlated and limits a
+1024-token, 64-token-block sequence to at most 16 mechanical blocks. The next
+controlled stage uses Salesforce/ConvoMem memory QA examples. It places gold
+evidence near the start, inserts answer-disjoint conversations from other
+examples, places the question near the end, and teacher-forces the gold answer.
+
+Primary controls are exact total token length, evidence-to-answer token
+distance, candidate-block count, distractor count/source, and fixed Top-N.
+Retrieval points are stored in sequence metadata and aligned to the answer
+generation bridge instead of sampled at regular intervals. Splits are grouped
+by source file/profile to prevent leakage.
+
+Long-context teacher collection prefills the prefix in bounded chunks and
+captures full-context attention only for the future answer horizon. A direct
+one-shot eager-attention forward is not a scalable 8K/16K collection method.
+
+The first experiment reuses the WikiText-trained checkpoint as an out-of-domain
+controlled evaluation. Training on long ConvoMem sequences is a separate
+stage because storing complete all-layer KV payloads for every training
+sequence has substantial linear disk cost.
+
+The initial training configuration is
+`configs/learnable_index_convomem4096_hpc.json`. It synthesizes 4096-token
+examples dynamically inside the task and never promotes the synthesized JSONL
+to persistent output. Each split is collected immediately and its JSONL plus
+manifest are deleted before the next split. Train/validation KV payloads are
+also omitted; their residual summaries and teacher labels are sufficient for
+query-key training/evaluation. Internal early-stopping holdout selection uses
+the same profile group identifier, so a profile cannot appear on both sides of
+that split. The 290-sample test split retains KV payloads
+only until fixed-policy replay completes. Node-local mode finally exports the
+best query-key checkpoint and training metrics and deletes the task workspace.
+
 ## Proposed Development Artifacts
 
 Names may change during implementation, but responsibilities should remain

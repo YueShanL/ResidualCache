@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Literal, Mapping
 
 from .contracts import BlockRange
 
@@ -31,6 +31,7 @@ class PlanConfig:
     retrieval_interval: int = 32
     minimum_candidate_blocks: int = 1
     maximum_candidate_blocks: int | None = None
+    retrieval_point_policy: Literal["interval", "metadata"] = "interval"
 
     def __post_init__(self) -> None:
         for name in (
@@ -45,6 +46,8 @@ class PlanConfig:
         if self.maximum_candidate_blocks is not None:
             if self.maximum_candidate_blocks < self.minimum_candidate_blocks:
                 raise ValueError("maximum_candidate_blocks cannot be smaller than minimum_candidate_blocks")
+        if self.retrieval_point_policy not in {"interval", "metadata"}:
+            raise ValueError("retrieval_point_policy must be 'interval' or 'metadata'")
 
 
 @dataclass(frozen=True)
@@ -85,21 +88,52 @@ def build_retrieval_plans(record: SequenceRecord, config: PlanConfig) -> list[Re
 
     token_count = len(record.token_ids)
     blocks = mechanical_blocks(record.sequence_id, token_count, config.block_size)
-    first_retrieval = (
-        config.local_context_length
-        + config.minimum_candidate_blocks * config.block_size
-        - 1
-    )
+    first_retrieval = config.local_context_length + config.minimum_candidate_blocks * config.block_size - 1
     # Future query positions are [t+1, t+H]. Their logits predict through t+H+1.
     last_retrieval = token_count - config.future_horizon_length - 2
+    if config.retrieval_point_policy == "metadata":
+        raw_points = record.metadata.get("retrieval_points")
+        if not isinstance(raw_points, list) or not raw_points:
+            raise ValueError(
+                f"sequence {record.sequence_id!r} has no metadata retrieval_points"
+            )
+        point_specs = []
+        for index, point in enumerate(raw_points):
+            if not isinstance(point, Mapping):
+                raise ValueError("metadata retrieval_points entries must be objects")
+            point_specs.append(
+                (
+                    int(point["retrieval_position"]),
+                    int(point.get("future_horizon_length", config.future_horizon_length)),
+                    str(point.get("name", index)),
+                )
+            )
+    else:
+        if first_retrieval > last_retrieval:
+            return []
+        point_specs = [
+            (position, config.future_horizon_length, "interval")
+            for position in range(
+                first_retrieval,
+                last_retrieval + 1,
+                config.retrieval_interval,
+            )
+        ]
+
     plans: list[RetrievalPlan] = []
-    if first_retrieval > last_retrieval:
-        return plans
-    for retrieval_position in range(
-        first_retrieval,
-        last_retrieval + 1,
-        config.retrieval_interval,
-    ):
+    seen_positions: set[int] = set()
+    for retrieval_position, future_horizon_length, point_name in point_specs:
+        if retrieval_position in seen_positions:
+            raise ValueError("retrieval positions must be unique within a sequence")
+        seen_positions.add(retrieval_position)
+        if future_horizon_length <= 0:
+            raise ValueError("metadata future_horizon_length must be positive")
+        point_last = token_count - future_horizon_length - 2
+        if retrieval_position < first_retrieval or retrieval_position > point_last:
+            raise ValueError(
+                f"retrieval point {retrieval_position} for {record.sequence_id!r} "
+                "cannot satisfy its context, candidate, horizon, and next-token bounds"
+            )
         local_end = retrieval_position + 1
         local_start = local_end - config.local_context_length
         candidates = tuple(block for block in blocks if block.end_position <= local_start)
@@ -109,11 +143,15 @@ def build_retrieval_plans(record: SequenceRecord, config: PlanConfig) -> list[Re
             continue
         plans.append(
             RetrievalPlan(
-                sample_id=f"{record.sequence_id}:retrieval:{retrieval_position:09d}",
+                sample_id=(
+                    f"{record.sequence_id}:retrieval:{retrieval_position:09d}:{point_name}"
+                    if config.retrieval_point_policy == "metadata"
+                    else f"{record.sequence_id}:retrieval:{retrieval_position:09d}"
+                ),
                 sequence_id=record.sequence_id,
                 retrieval_position=retrieval_position,
                 first_future_position_affected_by_retrieval=retrieval_position + 1,
-                future_horizon_length=config.future_horizon_length,
+                future_horizon_length=future_horizon_length,
                 local_context_start=local_start,
                 local_context_end=local_end,
                 candidate_blocks=candidates,
@@ -173,4 +211,3 @@ def load_sequence_records(
     if len({record.sequence_id for record in records}) != len(records):
         raise ValueError("sequence_id values must be unique")
     return records
-

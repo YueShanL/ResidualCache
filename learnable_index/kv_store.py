@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
+import time
 from typing import Any, Iterable, Mapping
 
 import torch
@@ -106,7 +107,17 @@ class KVBlockStore:
         with temporary.open("w", encoding="utf-8", newline="\n") as handle:
             json.dump(self.manifest, handle, indent=2, ensure_ascii=False)
             handle.write("\n")
-        temporary.replace(self.manifest_path)
+        for attempt in range(6):
+            try:
+                temporary.replace(self.manifest_path)
+                break
+            except PermissionError:
+                if attempt == 5:
+                    raise
+                # Windows virus scanners and indexers can transiently hold the
+                # just-flushed file. Keep the operation atomic and retry with
+                # bounded backoff instead of falling back to an in-place write.
+                time.sleep(0.05 * (2**attempt))
 
     def contains(self, block_id: str) -> bool:
         return block_id in self.manifest["blocks"]

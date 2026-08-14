@@ -193,7 +193,7 @@ def fit_router(
         "torch_version": torch.__version__,
         "train_samples": len(train_dataset),
         "validation_samples": len(validation_dataset) if validation_dataset else 0,
-        "split_policy": "grouped_by_sequence_id",
+        "split_policy": "grouped_by_split_group_id_or_sequence_id",
         "information_boundary": {
             "query_input": "student_restricted",
             "block_input": "student_restricted",

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import torch
 
 from learnable_index.aligned_builder import AlignedCollectionConfig, collect_aligned_dataset
-from learnable_index.collectors import StudentCollectionConfig
+from learnable_index.collectors import StudentCollectionConfig, TeacherAttentionCollector
 from learnable_index.config import (
     AttentionAggregationConfig,
     LossConfig,
@@ -21,9 +21,14 @@ from learnable_index.model_adapter import (
     trim_prefix_and_local_kv,
 )
 from learnable_index.planning import PlanConfig, SequenceRecord, build_retrieval_plans
-from learnable_index.replay import ReplayConfig, evaluate_retrieval_replay
+from learnable_index.replay import (
+    ReplayConfig,
+    _full_context_logits,
+    evaluate_retrieval_replay,
+)
 from learnable_index.retrieval import RetrievalPolicyConfig, decide_retrieval
 from learnable_index.synthetic import make_synthetic_samples
+from learnable_index.topn_sweep import TopNSweepConfig, evaluate_topn_sweep
 from learnable_index.trainer import fit_router
 
 
@@ -47,6 +52,29 @@ class FakeTextBody(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.embed_tokens = torch.nn.Embedding(64, 4)
+        self.layers = torch.nn.ModuleList(
+            [SimpleNamespaceLayer() for _ in range(FakeGemmaConfig.num_hidden_layers)]
+        )
+
+
+class FakeSelfAttention(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.zeros(()))
+
+    def forward(self, positions, key_length):
+        keys = torch.arange(key_length, device=positions.device)
+        allowed = keys.view(1, 1, -1) <= positions[:, :, None]
+        weights = allowed.float()
+        weights = weights / weights.sum(dim=-1, keepdim=True)
+        weights = weights[:, None].repeat(1, FakeGemmaConfig.num_attention_heads, 1, 1)
+        return None, weights
+
+
+class SimpleNamespaceLayer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.self_attn = FakeSelfAttention()
 
 
 class FakeGemma(torch.nn.Module):
@@ -81,12 +109,15 @@ class FakeGemma(torch.nn.Module):
                 value = key + 100
                 past_key_values.update(key, value, layer_index)
 
-        attentions = None
-        if output_attentions:
-            causal = torch.tril(torch.ones(query_length, query_length, device=input_ids.device))
-            causal = causal / causal.sum(dim=-1, keepdim=True)
-            attention = causal[None, None].repeat(batch, self.config.num_attention_heads, 1, 1)
-            attentions = tuple(attention.clone() for _ in range(self.config.num_hidden_layers))
+        key_length = (
+            past_key_values.get_seq_length()
+            if use_cache and past_key_values is not None
+            else int(position_ids.max().item()) + 1
+        )
+        layer_attentions = tuple(
+            layer.self_attn(position_ids, key_length)[1] for layer in self.model.layers
+        )
+        attentions = layer_attentions if output_attentions else None
 
         vocabulary = 64
         logits = torch.full(
@@ -136,6 +167,53 @@ def test_retrieval_planning_reserves_first_affected_forward_and_target():
     assert plans[-1].future_end < len(record.token_ids)
 
 
+def test_metadata_retrieval_point_and_chunked_teacher_match_full_teacher():
+    record = SequenceRecord(
+        "answer-sequence",
+        tuple(range(1, 31)),
+        {
+            "retrieval_points": [
+                {
+                    "name": "answer",
+                    "retrieval_position": 25,
+                    "future_horizon_length": 3,
+                }
+            ]
+        },
+    )
+    plan = build_retrieval_plans(
+        record,
+        PlanConfig(
+            local_context_length=4,
+            block_size=2,
+            future_horizon_length=2,
+            retrieval_interval=2,
+            minimum_candidate_blocks=2,
+            retrieval_point_policy="metadata",
+        ),
+    )[0]
+    assert plan.sample_id.endswith(":answer")
+    assert plan.future_horizon_length == 3
+    config = AttentionAggregationConfig(teacher_layers=(0, 1))
+    full = TeacherAttentionCollector(fake_bundle(), config).collect(record, plan)
+    chunked = TeacherAttentionCollector(
+        fake_bundle(), config, prefill_chunk_size=5
+    ).collect(record, plan)
+    torch.testing.assert_close(chunked.absolute_block_mass, full.absolute_block_mass)
+    torch.testing.assert_close(
+        chunked.conditional_block_distribution,
+        full.conditional_block_distribution,
+    )
+    assert chunked.metadata["collection_mode"] == (
+        "chunked_prefix_selected_layer_eager_hooks"
+    )
+    full_logits, _ = _full_context_logits(fake_bundle(), record, plan)
+    chunked_logits, _ = _full_context_logits(
+        fake_bundle(), record, plan, prefill_chunk_size=5
+    )
+    torch.testing.assert_close(chunked_logits, full_logits)
+
+
 def test_kv_store_round_trip_merge_and_trim(tmp_path):
     sample = make_synthetic_samples(sample_count=1, residual_dim=4, min_blocks=2, max_blocks=2)[0]
     store = KVBlockStore(tmp_path / "kv")
@@ -168,6 +246,65 @@ def test_kv_store_round_trip_merge_and_trim(tmp_path):
         maximum_local_tokens=2,
     )
     assert trimmed[0][0].shape[2] == merged[0][0].shape[2] + 2
+
+
+def test_kv_manifest_atomic_replace_retries_transient_windows_lock(tmp_path, monkeypatch):
+    sample = make_synthetic_samples(
+        sample_count=1, residual_dim=4, min_blocks=1, max_blocks=1
+    )[0]
+    block_range = sample.candidate_blocks[0]
+    key = torch.zeros(1, 1, block_range.length, 2)
+    block = KVBlock(
+        block=block_range,
+        sequence_id=sample.sequence_id,
+        token_ids=tuple(range(block_range.length)),
+        logical_positions=tuple(
+            range(block_range.start_position, block_range.end_position)
+        ),
+        layer_kv=((key, key),),
+        residual_summary=torch.zeros(4),
+        model_fingerprint={"model": "fake"},
+        metadata={},
+    )
+    original_replace = type(tmp_path).replace
+    attempts = 0
+
+    def flaky_replace(path, target):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise PermissionError("transient test lock")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(type(tmp_path), "replace", flaky_replace)
+    store = KVBlockStore(tmp_path / "kv-retry")
+    store.save(block)
+    assert attempts == 2
+    assert store.load(block_range.block_id).block == block_range
+
+
+def test_training_collection_can_skip_persistent_kv_payload(tmp_path):
+    bundle = fake_bundle()
+    record = SequenceRecord("summary-only", tuple(range(1, 15)), {})
+    plan = build_retrieval_plans(
+        record,
+        PlanConfig(local_context_length=4, block_size=2, future_horizon_length=2),
+    )[0]
+    store = KVBlockStore(tmp_path / "summary-only-kv")
+    student = StudentCollectionConfig(
+        local_context_length=4,
+        residual_layer=-1,
+        query_summary="mean",
+        query_summary_length=2,
+    )
+    from learnable_index.collectors import RestrictedStudentCollector
+
+    blocks = RestrictedStudentCollector(bundle, student).ensure_blocks(
+        record, plan, store, persist=False
+    )
+    assert len(blocks) == len(plan.candidate_blocks)
+    assert store.manifest["blocks"] == {}
+    assert list(store.blocks_dir.iterdir()) == []
 
 
 def test_sparse_prefix_mask_and_manual_score_threshold_policy():
@@ -281,3 +418,52 @@ def test_fake_gemma_collect_train_and_replay_end_to_end(tmp_path):
     }
     assert (tmp_path / "replay" / "samples.jsonl").is_file()
     assert (tmp_path / "replay" / "summary.json").is_file()
+
+    sweep = evaluate_topn_sweep(
+        bundle,
+        collection_dir,
+        training_dir / "best.pt",
+        tmp_path / "sweep",
+        TopNSweepConfig(
+            budgets=(1, 2),
+            router_device="cpu",
+            bootstrap_iterations=50,
+        ),
+    )
+    assert sweep["sample_count"] == len(dataset)
+    assert set(sweep["conditions"]) == {
+        "full_context",
+        "local_256",
+        "predicted_top_1",
+        "predicted_top_2",
+        "recent_top_1",
+        "recent_top_2",
+        "random_top_1",
+        "random_top_2",
+        "oracle_top_1",
+        "oracle_top_2",
+    }
+    assert "predicted_top_1_vs_recent_top_1" in sweep["paired_comparisons"]
+    assert sweep["conditions"]["local_256"]["local_kv_bytes"] > 0
+    assert sweep["conditions"]["predicted_top_1"]["total_visible_kv_bytes"] > (
+        sweep["conditions"]["local_256"]["total_visible_kv_bytes"]
+    )
+    assert (tmp_path / "sweep" / "samples.jsonl").is_file()
+    assert (tmp_path / "sweep" / "summary.json").is_file()
+    resumed_sweep = evaluate_topn_sweep(
+        bundle,
+        collection_dir,
+        training_dir / "best.pt",
+        tmp_path / "sweep",
+        TopNSweepConfig(
+            budgets=(1, 2),
+            router_device="cpu",
+            bootstrap_iterations=50,
+        ),
+    )
+    assert resumed_sweep == sweep
+    assert len(
+        (tmp_path / "sweep" / "samples.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ) == len(dataset)

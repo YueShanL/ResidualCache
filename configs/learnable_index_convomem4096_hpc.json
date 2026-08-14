@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "run_id": "learnable_index_convomem_4096tokens_4096train_query_key_v1",
+  "seed": 13,
+  "paths": {
+    "output_root": "outputs/learnable_index_convomem_4096tokens_4096train_query_key_v1",
+    "use_tmp_workspace": true,
+    "tmp_workspace_root": "/tmp"
+  },
+  "model": {
+    "name": "google/gemma-4-E4B-it",
+    "device": "cuda",
+    "dtype": "bfloat16",
+    "allow_network": true
+  },
+  "data": {
+    "source": "convomem",
+    "dataset_name": "Salesforce/ConvoMem",
+    "cache_dir": null,
+    "allow_network": true,
+    "sequence_length": 4096,
+    "maximum_answer_tokens": 64,
+    "maximum_future_horizon": 16,
+    "persist_prepared_inputs": false,
+    "splits": {
+      "train": {
+        "sequences": 4096,
+        "store_kv_payload": false
+      },
+      "validation": {
+        "sequences": 295,
+        "store_kv_payload": false
+      },
+      "test": {
+        "sequences": 290,
+        "store_kv_payload": true
+      }
+    }
+  },
+  "collection": {
+    "local_context_length": 256,
+    "block_size": 64,
+    "future_horizon": 16,
+    "retrieval_interval": 128,
+    "retrieval_point_policy": "metadata",
+    "minimum_candidate_blocks": 2,
+    "maximum_candidate_blocks": null,
+    "teacher_prefill_chunk_size": 256,
+    "residual_layer": 40,
+    "query_summary": "mean",
+    "query_summary_length": 16,
+    "teacher_layers": [
+      29,
+      35,
+      41
+    ],
+    "teacher_heads": "all",
+    "future_reduction": "mean",
+    "length_normalize_blocks": false,
+    "progress_every": 25
+  },
+  "router": {
+    "projection_dim": 128,
+    "hidden_dim": 256,
+    "depth": 2,
+    "dropout": 0.1,
+    "temperature": 0.07
+  },
+  "training": {
+    "epochs": 10,
+    "early_stopping_patience": 2,
+    "batch_size": 32,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.0001,
+    "validation_fraction": 0.1,
+    "top_n": 4,
+    "device": "cuda"
+  },
+  "evaluation": {
+    "top_n": 4,
+    "device": "cuda"
+  },
+  "replay": {
+    "enabled": true,
+    "split": "test",
+    "policy": "fixed",
+    "top_n": 4,
+    "score_threshold": 0.0,
+    "maximum_samples": null,
+    "router_device": "cuda"
+  },
+  "stages": {
+    "prepare": true,
+    "collect": true,
+    "train": true,
+    "evaluate": true,
+    "replay": true
+  }
+}

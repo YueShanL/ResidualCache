@@ -110,6 +110,26 @@ The output root contains `collection/`, `training/`, `replay/`, and
 context, full-context argmax agreement, visible KV bytes, latency, and logical
 attention query/key pairs.
 
+After training, reuse an official-test collection to compare fixed retrieval
+budgets without retraining:
+
+```powershell
+..\venv\Scripts\python.exe -m learnable_index topn-sweep `
+  --model-name google/gemma-4-E4B-it `
+  --model-device cuda `
+  --dtype bfloat16 `
+  --collection-dir outputs/learnable_index_topn_validation/collection/test `
+  --checkpoint outputs/learnable_index_wikitext103_4096docs_query_key_v1/best.pt `
+  --output-dir outputs/learnable_index_topn_validation/sweep `
+  --budgets 1,2,4,8 `
+  --router-device cuda
+```
+
+The sweep evaluates full context and local-256 once per sample, then compares
+learned, recent, deterministic-random, and oracle selection at each budget. It
+writes per-sample paired results, bootstrap confidence intervals, exact visible
+KV bytes, attention pairs, and CUDA allocated/reserved peak measurements.
+
 ## Offline smoke run
 
 Run from `ResidualCache` with the parent repository environment:
@@ -202,12 +222,85 @@ submit another job. An alternative JSON file may be passed as the first script
 argument. Completed stages are validated and skipped on resubmission; a changed
 experiment config must use a different `output_root`.
 
+## Controlled long-distance ConvoMem sequences
+
+WikiText preserves natural document order, so relevance and recency are
+correlated. The ConvoMem preparer creates a controlled sequence instead:
+
+```text
+target evidence -> unrelated ConvoMem conversations -> final question
+-> generation bridge -> gold answer
+```
+
+The output has an exact token length. Distractors come from other examples in
+the same source-file-grouped split and are rejected if they contain the target
+answer. Each row records evidence, distractor, question, and answer token
+ranges plus the exact evidence-to-answer distance. Train/validation/test use a
+deterministic 80/10/10 hash split grouped by source file/profile.
+
+```powershell
+python -m learnable_index.prepare_convomem `
+  --dataset-name Salesforce/ConvoMem `
+  --tokenizer google/gemma-4-E4B-it `
+  --output outputs/convomem_long/test_64x4096.jsonl `
+  --split test --sequence-length 4096 --sequences 64 `
+  --maximum-answer-tokens 64 --maximum-future-horizon 16
+
+python -m learnable_index collect `
+  --model-name google/gemma-4-E4B-it `
+  --model-device cuda --dtype bfloat16 `
+  --input-jsonl outputs/convomem_long/test_64x4096.jsonl `
+  --output-dir outputs/convomem_long/collection/test `
+  --local-context-length 256 --block-size 64 `
+  --future-horizon 16 --retrieval-interval 128 `
+  --retrieval-point-policy metadata `
+  --minimum-candidate-blocks 2 `
+  --teacher-prefill-chunk-size 256 `
+  --residual-layer 40 --query-summary mean --query-summary-length 16 `
+  --teacher-layers 29,35,41 --teacher-heads all
+```
+
+Chunked teacher prefill captures attention only for the answer horizon, so the
+transient attention tensor scales with `horizon * context_length` instead of a
+full eager attention square. The staged length sweep should be 2K, 4K, 8K,
+then 16K while keeping target examples, split hash, local window, block size,
+teacher layers, and checkpoint fixed. Report exact distance and candidate
+count, not only nominal sequence length. Full autoregressive answer EM/F1 is
+the next evaluation layer; teacher-forced NLL remains a diagnostic.
+
+The first 4K ConvoMem training run is defined by
+`configs/learnable_index_convomem4096_hpc.json`: 4096 training sequences, a
+profile-grouped 10% internal holdout, 295 independent validation sequences,
+and 290 independent test/replay sequences. It preserves the WikiText router,
+optimizer, regularization, epoch, and early-stopping settings. Candidate blocks
+are unbounded so early evidence remains eligible.
+
+This config uses `"persist_prepared_inputs": false`. The runner processes each
+split as an ephemeral dynamic stage:
+
+```text
+synthesize split JSONL -> collect aligned samples -> delete JSONL + manifest
+```
+
+Train and validation omit KV payload persistence because query-key training and
+evaluation need only summaries and labels. Test retains KV payloads for the
+complete 290-sample replay. With node-local temporary mode enabled, successful
+completion exports only `best.pt`, `metrics.jsonl`, and `summary.json`, then
+removes the remaining task workspace. Run the fixed task script with the
+ConvoMem config as its argument:
+
+```bash
+sbatch scripts/submit_learnable_index_hpc.slurm \
+  configs/learnable_index_convomem4096_hpc.json
+```
+
 ## Current research boundary
 
 - Collection is teacher-forced; it does not synthesize autoregressive training
   trajectories.
-- Retrieval points follow a fixed mechanical interval. Fixed Top-N and manual
-  query-key score thresholds do not reschedule the next retrieval point.
+- Retrieval points follow a fixed mechanical interval for natural documents,
+  or explicit answer-aligned input metadata for controlled QA. Fixed Top-N and
+  manual query-key score thresholds do not reschedule the next retrieval point.
 - Student collection uses local-only history without recurrently exposing
   previously retrieved blocks. Replay does expose selected blocks to future
   forwards and records this policy explicitly.

@@ -39,9 +39,14 @@ class TeacherAttentionCollector:
         self,
         bundle: ModelBundle,
         aggregation_config: AttentionAggregationConfig,
+        *,
+        prefill_chunk_size: int | None = None,
     ) -> None:
         self.bundle = bundle
         self.aggregation_config = aggregation_config
+        if prefill_chunk_size is not None and prefill_chunk_size <= 0:
+            raise ValueError("prefill_chunk_size must be positive when set")
+        self.prefill_chunk_size = prefill_chunk_size
 
     def collect(self, record: SequenceRecord, plan: RetrievalPlan) -> TeacherAttentionTarget:
         teacher_end = plan.future_end
@@ -69,28 +74,81 @@ class TeacherAttentionCollector:
                     break
                 attention_modules.append((layer_index, attention_module))
 
+        chunked = self.prefill_chunk_size is not None and bool(attention_modules)
         for layer_index, attention_module in attention_modules:
             def capture(_module, _inputs, output, *, index=layer_index):
                 weights = output[1] if isinstance(output, tuple) else None
                 if weights is None or weights.ndim != 4:
                     raise RuntimeError(f"teacher hook did not receive attention at layer {index}")
-                captured[index] = (
-                    weights[0, :, future_start:teacher_end, :teacher_end]
-                    .detach()
-                    .float()
-                    .cpu()
-                )
+                query_weights = weights[0, :, :, :teacher_end]
+                if not chunked:
+                    query_weights = query_weights[:, future_start:teacher_end]
+                if query_weights.shape[-2:] != (
+                    teacher_end - future_start,
+                    teacher_end,
+                ):
+                    raise RuntimeError(
+                        f"teacher attention shape mismatch at layer {index}: "
+                        f"{tuple(query_weights.shape)}"
+                    )
+                captured[index] = query_weights.detach().float().cpu()
 
             handles.append(attention_module.register_forward_hook(capture))
         if handles:
             try:
-                forward_tokens(
-                    self.bundle,
-                    record.token_ids[:teacher_end],
-                    range(teacher_end),
-                    use_cache=False,
-                    output_attentions=False,
-                )
+                if chunked:
+                    cache = new_full_dynamic_cache()
+                    chunk_size = int(self.prefill_chunk_size)
+                    # Hooks must observe only the final answer horizon. Disable
+                    # them while materializing the linear-memory full prefix.
+                    for handle in handles:
+                        handle.remove()
+                    handles = []
+                    for start in range(0, future_start, chunk_size):
+                        end = min(start + chunk_size, future_start)
+                        forward_tokens(
+                            self.bundle,
+                            record.token_ids[start:end],
+                            range(start, end),
+                            past_key_values=cache,
+                            use_cache=True,
+                            output_attentions=False,
+                        )
+                    for layer_index, attention_module in attention_modules:
+                        def capture_chunked(_module, _inputs, output, *, index=layer_index):
+                            weights = output[1] if isinstance(output, tuple) else None
+                            if weights is None or weights.ndim != 4:
+                                raise RuntimeError(
+                                    f"teacher hook did not receive attention at layer {index}"
+                                )
+                            query_weights = weights[0, :, :, :teacher_end]
+                            if query_weights.shape[-2:] != (
+                                teacher_end - future_start,
+                                teacher_end,
+                            ):
+                                raise RuntimeError(
+                                    f"chunked teacher attention shape mismatch at layer {index}: "
+                                    f"{tuple(query_weights.shape)}"
+                                )
+                            captured[index] = query_weights.detach().float().cpu()
+
+                        handles.append(attention_module.register_forward_hook(capture_chunked))
+                    forward_tokens(
+                        self.bundle,
+                        record.token_ids[future_start:teacher_end],
+                        range(future_start, teacher_end),
+                        past_key_values=cache,
+                        use_cache=False,
+                        output_attentions=False,
+                    )
+                else:
+                    forward_tokens(
+                        self.bundle,
+                        record.token_ids[:teacher_end],
+                        range(teacher_end),
+                        use_cache=False,
+                        output_attentions=False,
+                    )
             finally:
                 for handle in handles:
                     handle.remove()
@@ -99,7 +157,11 @@ class TeacherAttentionCollector:
                 raise RuntimeError(f"teacher attention hooks missed layers: {sorted(missing)}")
             selected = torch.stack([captured[index] for index in selected_layer_indices])
             aggregation_config = replace(self.aggregation_config, teacher_layers=None)
-            collection_mode = "selected_layer_eager_hooks"
+            collection_mode = (
+                "chunked_prefix_selected_layer_eager_hooks"
+                if chunked
+                else "selected_layer_eager_hooks"
+            )
         else:
             # Test doubles and compatible non-Gemma wrappers may expose only
             # public output_attentions. This path retains strict validation.
@@ -151,6 +213,7 @@ class TeacherAttentionCollector:
                 "teacher_visible_range": [0, teacher_end],
                 "future_query_range": [future_start, teacher_end],
                 "information_boundary": "labels_only",
+                "teacher_prefill_chunk_size": self.prefill_chunk_size,
             },
         )
 
@@ -245,9 +308,14 @@ class RestrictedStudentCollector:
         record: SequenceRecord,
         plan: RetrievalPlan,
         store: KVBlockStore,
+        *,
+        persist: bool = True,
     ) -> list[KVBlock]:
         blocks: list[KVBlock] = []
         for block_range in plan.candidate_blocks:
+            if not persist:
+                blocks.append(self.collect_block(record, block_range))
+                continue
             if not store.contains(block_range.block_id):
                 store.save(self.collect_block(record, block_range))
             block = store.load(block_range.block_id)
@@ -303,5 +371,8 @@ def assemble_retrieval_sample(
             "teacher_visible_range": [0, plan.future_end],
             "first_future_position_affected_by_retrieval": plan.future_start,
             "student_memory_policy": "local_only_no_recurrent_retrieval_during_collection",
+            "split_group_id": record.metadata.get(
+                "split_group_id", record.sequence_id
+            ),
         },
     ).validate()

@@ -20,6 +20,7 @@ from .model_adapter import (
     concatenate_layer_kv,
     forward_tokens,
     layer_kv_from_cache,
+    new_full_dynamic_cache,
     trim_prefix_and_local_kv,
 )
 from .planning import SequenceRecord
@@ -69,19 +70,44 @@ def _full_context_logits(
     bundle: ModelBundle,
     record: SequenceRecord,
     sample,
+    *,
+    prefill_chunk_size: int | None = None,
 ) -> tuple[torch.Tensor, int]:
     end = sample.first_future_position_affected_by_retrieval + sample.future_horizon_length
-    output = forward_tokens(
-        bundle,
-        record.token_ids[:end],
-        range(end),
-        use_cache=False,
-    )
     start = sample.first_future_position_affected_by_retrieval
+    if prefill_chunk_size is not None:
+        if prefill_chunk_size <= 0:
+            raise ValueError("prefill_chunk_size must be positive when set")
+        cache = new_full_dynamic_cache()
+        for chunk_start in range(0, start, prefill_chunk_size):
+            chunk_end = min(chunk_start + prefill_chunk_size, start)
+            forward_tokens(
+                bundle,
+                record.token_ids[chunk_start:chunk_end],
+                range(chunk_start, chunk_end),
+                past_key_values=cache,
+                use_cache=True,
+            )
+        output = forward_tokens(
+            bundle,
+            record.token_ids[start:end],
+            range(start, end),
+            past_key_values=cache,
+            use_cache=False,
+        )
+        logits = output.logits[0].detach().float().cpu()
+    else:
+        output = forward_tokens(
+            bundle,
+            record.token_ids[:end],
+            range(end),
+            use_cache=False,
+        )
+        logits = output.logits[0, start:end].detach().float().cpu()
     # Logical per-layer query/key pairs actually computed by this direct full
     # teacher-forced forward (causal triangle over the visible prefix).
     attention_pairs = end * (end + 1) // 2
-    return output.logits[0, start:end].detach().float().cpu(), attention_pairs
+    return logits, attention_pairs
 
 
 @torch.no_grad()
@@ -191,6 +217,9 @@ def evaluate_retrieval_replay(
     student_config = StudentCollectionConfig(
         **collection_manifest["collection_config"]["student"]
     )
+    teacher_prefill_chunk_size = collection_manifest["collection_config"].get(
+        "teacher_prefill_chunk_size"
+    )
     student = RestrictedStudentCollector(bundle, student_config)
     router, _, _, _, checkpoint = load_checkpoint(checkpoint_path)
     router_device = resolve_device(config.router_device)
@@ -217,7 +246,12 @@ def evaluate_retrieval_replay(
             raise RuntimeError(f"student query recollection drifted by {maximum_error}")
         local_layer_kv = student.collect_local_cache(record, sample)
         full_start = time.perf_counter()
-        full_logits, full_attention_pairs = _full_context_logits(bundle, record, sample)
+        full_logits, full_attention_pairs = _full_context_logits(
+            bundle,
+            record,
+            sample,
+            prefill_chunk_size=teacher_prefill_chunk_size,
+        )
         full_latency = time.perf_counter() - full_start
         targets = torch.tensor(
             record.token_ids[

@@ -177,7 +177,13 @@ def split_dataset(
         raise ValueError("validation_fraction must be in [0, 1)")
     if validation_fraction == 0 or len(dataset) < 2:
         return dataset, None
-    sequence_ids = sorted({sample.sequence_id for sample in dataset.samples})
+    def split_group(sample: RetrievalSample) -> str:
+        return str(
+            sample.logical_position_metadata.get("split_group_id")
+            or sample.sequence_id
+        )
+
+    sequence_ids = sorted({split_group(sample) for sample in dataset.samples})
     # Splitting retrieval points from one sequence across train/validation leaks
     # adjacent residuals and repeated block summaries. With one sequence, report
     # no validation split instead of presenting a contaminated metric.
@@ -188,9 +194,9 @@ def split_dataset(
     validation_group_count = min(validation_group_count, len(sequence_ids) - 1)
     validation_sequences = set(sequence_ids[:validation_group_count])
     train = [
-        sample for sample in dataset.samples if sample.sequence_id not in validation_sequences
+        sample for sample in dataset.samples if split_group(sample) not in validation_sequences
     ]
     validation = [
-        sample for sample in dataset.samples if sample.sequence_id in validation_sequences
+        sample for sample in dataset.samples if split_group(sample) in validation_sequences
     ]
     return RetrievalDataset(train), RetrievalDataset(validation)

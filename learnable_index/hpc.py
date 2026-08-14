@@ -62,20 +62,25 @@ def validate_hpc_config(config: dict[str, Any]) -> None:
         if section not in config:
             raise ValueError(f"missing config section: {section}")
     splits = config["data"].get("splits", {})
+    data_source = str(config["data"].get("source", "wikitext"))
+    if data_source not in {"wikitext", "convomem"}:
+        raise ValueError("data.source must be 'wikitext' or 'convomem'")
     if tuple(splits) != REQUIRED_SPLITS:
         raise ValueError(f"data.splits must be ordered as {REQUIRED_SPLITS}")
     for split in REQUIRED_SPLITS:
         split_config = splits[split]
         if int(split_config["sequences"]) <= 0:
             raise ValueError(f"{split} sequence count must be positive")
-        if int(split_config["article_stride"]) <= 0:
+        if data_source == "wikitext" and int(split_config["article_stride"]) <= 0:
             raise ValueError(f"{split} article_stride must be positive")
     if int(config["data"]["sequence_length"]) < 2:
         raise ValueError("data.sequence_length must be at least 2")
     _require_hf_id(config["model"].get("name"), "model.name")
     _require_hf_id(config["data"].get("dataset_name"), "data.dataset_name")
-    if not str(config["data"].get("dataset_config", "")).strip():
+    if data_source == "wikitext" and not str(config["data"].get("dataset_config", "")).strip():
         raise ValueError("data.dataset_config must be non-empty")
+    if not isinstance(config["data"].get("persist_prepared_inputs", True), bool):
+        raise ValueError("data.persist_prepared_inputs must be a boolean")
     if not 0 < float(config["training"]["validation_fraction"]) < 1:
         raise ValueError("training.validation_fraction must be strictly between 0 and 1")
     patience = config["training"].get("early_stopping_patience")
@@ -257,6 +262,8 @@ class HPCPipeline:
 
     def _expected_samples(self, split: str) -> int:
         data = self.config["data"]
+        if str(data.get("source", "wikitext")) == "convomem":
+            return int(data["splits"][split]["sequences"])
         collection = self.config["collection"]
         first = (
             int(collection["local_context_length"])
@@ -276,10 +283,28 @@ class HPCPipeline:
         )
         return count_per_sequence * int(data["splits"][split]["sequences"])
 
-    def prepare_inputs(self) -> None:
+    def _prepared_inputs_are_ephemeral(self) -> bool:
+        return not bool(self.config["data"].get("persist_prepared_inputs", True))
+
+    def _cleanup_prepared_input(self, split: str) -> None:
+        if not self._prepared_inputs_are_ephemeral():
+            return
+        paths = (
+            self._input_path(split),
+            self._input_path(split).with_suffix(".manifest.json"),
+        )
+        removed: list[str] = []
+        for path in paths:
+            if path.is_file():
+                path.unlink()
+                removed.append(str(path))
+        if removed:
+            self._emit("prepared_input_removed", split=split, paths=removed)
+
+    def prepare_inputs(self, splits: Iterable[str] = REQUIRED_SPLITS) -> None:
         if not self._enabled("prepare"):
             return
-        for split in REQUIRED_SPLITS:
+        for split in splits:
             split_config = self.config["data"]["splits"][split]
             output = self._input_path(split)
             manifest = output.with_suffix(".manifest.json")
@@ -297,32 +322,44 @@ class HPCPipeline:
                 continue
             if output.exists() or manifest.exists():
                 raise RuntimeError(f"partial prepared input exists for split={split}")
-            self._run_command(
-                f"prepare:{split}",
-                [
+            common = [
+                "--dataset-name",
+                str(self.config["data"]["dataset_name"]),
+                "--tokenizer",
+                str(self.config["model"]["name"]),
+                "--output",
+                str(output),
+                "--split",
+                split,
+                "--sequence-length",
+                str(self.config["data"]["sequence_length"]),
+                "--sequences",
+                str(split_config["sequences"]),
+                "--seed",
+                str(self.config.get("seed", 13)),
+                *self._huggingface_arguments(),
+            ]
+            if str(self.config["data"].get("source", "wikitext")) == "convomem":
+                arguments = [
+                    "-m",
+                    "learnable_index.prepare_convomem",
+                    *common,
+                    "--maximum-answer-tokens",
+                    str(self.config["data"].get("maximum_answer_tokens", 64)),
+                    "--maximum-future-horizon",
+                    str(self.config["data"].get("maximum_future_horizon", 16)),
+                ]
+            else:
+                arguments = [
                     "-m",
                     "learnable_index.prepare_wikitext",
-                    "--dataset-name",
-                    str(self.config["data"]["dataset_name"]),
+                    *common,
                     "--dataset-config",
                     str(self.config["data"]["dataset_config"]),
-                    "--tokenizer",
-                    str(self.config["model"]["name"]),
-                    "--output",
-                    str(output),
-                    "--split",
-                    split,
-                    "--sequence-length",
-                    str(self.config["data"]["sequence_length"]),
-                    "--sequences",
-                    str(split_config["sequences"]),
                     "--article-stride",
                     str(split_config["article_stride"]),
-                    "--seed",
-                    str(self.config.get("seed", 13)),
-                    *self._huggingface_arguments(),
-                ],
-            )
+                ]
+            self._run_command(f"prepare:{split}", arguments)
 
     def _huggingface_arguments(self) -> list[str]:
         arguments: list[str] = []
@@ -346,7 +383,7 @@ class HPCPipeline:
             arguments.append("--allow-network")
         return arguments
 
-    def _collection_arguments(self) -> list[str]:
+    def _collection_arguments(self, split: str | None = None) -> list[str]:
         config = self.config["collection"]
         teacher_layers = config.get("teacher_layers", "all")
         teacher_heads = config.get("teacher_heads", "all")
@@ -361,10 +398,10 @@ class HPCPipeline:
             str(config["future_horizon"]),
             "--retrieval-interval",
             str(config["retrieval_interval"]),
+            "--retrieval-point-policy",
+            str(config.get("retrieval_point_policy", "interval")),
             "--minimum-candidate-blocks",
             str(config["minimum_candidate_blocks"]),
-            "--maximum-candidate-blocks",
-            str(config["maximum_candidate_blocks"]),
             "--residual-layer",
             str(config["residual_layer"]),
             "--query-summary",
@@ -380,14 +417,29 @@ class HPCPipeline:
             "--progress-every",
             str(config.get("progress_every", 25)),
         ]
+        if config.get("maximum_candidate_blocks") is not None:
+            arguments.extend(
+                ["--maximum-candidate-blocks", str(config["maximum_candidate_blocks"])]
+            )
         if bool(config.get("length_normalize_blocks", False)):
             arguments.append("--length-normalize-blocks")
+        if config.get("teacher_prefill_chunk_size") is not None:
+            arguments.extend(
+                [
+                    "--teacher-prefill-chunk-size",
+                    str(config["teacher_prefill_chunk_size"]),
+                ]
+            )
+        if split is not None and not bool(
+            self.config["data"]["splits"][split].get("store_kv_payload", True)
+        ):
+            arguments.append("--no-store-kv-payload")
         return arguments
 
-    def collect(self) -> None:
+    def collect(self, splits: Iterable[str] = REQUIRED_SPLITS) -> None:
         if not self._enabled("collect"):
             return
-        for split in REQUIRED_SPLITS:
+        for split in splits:
             output = self._collection_dir(split)
             manifest_path = output / "collection_manifest.json"
             if manifest_path.exists():
@@ -415,7 +467,7 @@ class HPCPipeline:
                     str(self._input_path(split)),
                     "--output-dir",
                     str(output),
-                    *self._collection_arguments(),
+                    *self._collection_arguments(split),
                 ],
             )
 
@@ -537,8 +589,15 @@ class HPCPipeline:
             config_fingerprint=self.fingerprint,
             slurm_job_id=os.environ.get("SLURM_JOB_ID"),
         )
-        self.prepare_inputs()
-        self.collect()
+        if self._prepared_inputs_are_ephemeral():
+            for split in REQUIRED_SPLITS:
+                self.prepare_inputs((split,))
+                self.collect((split,))
+                if (self._collection_dir(split) / "collection_manifest.json").is_file():
+                    self._cleanup_prepared_input(split)
+        else:
+            self.prepare_inputs()
+            self.collect()
         self.train()
         self.evaluate()
         self.replay()
@@ -593,7 +652,7 @@ def main(argv: list[str] | None = None) -> int:
                     "config_fingerprint": _fingerprint(config),
                     "model_name": config["model"]["name"],
                     "dataset_name": config["data"]["dataset_name"],
-                    "dataset_config": config["data"]["dataset_config"],
+                    "dataset_config": config["data"].get("dataset_config"),
                     "output_root": str(_output_path(config)),
                     "use_tmp_workspace": bool(
                         config["paths"].get("use_tmp_workspace", False)

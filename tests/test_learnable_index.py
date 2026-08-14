@@ -28,6 +28,12 @@ from learnable_index.prepare_wikitext import (
     build_wikitext_sequences,
     iter_wikitext_articles,
 )
+from learnable_index.prepare_convomem import (
+    ConvoMemExample,
+    _split_for_source,
+    build_convomem_long_sequences,
+)
+from learnable_index.planning import PlanConfig, SequenceRecord, build_retrieval_plans
 from learnable_index.synthetic import make_synthetic_samples
 from learnable_index.targets import aggregate_teacher_attention
 from learnable_index.trainer import fit_router, load_checkpoint
@@ -39,6 +45,30 @@ class _WhitespaceTokenizer:
         tokens = [101]
         tokens.extend(range(200, 200 + len(text.split())))
         return type("Encoding", (), {"input_ids": tokens})()
+
+
+class _CharacterChatTokenizer:
+    eos_token_id = 2
+
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+        assert not tokenize and add_generation_prompt
+        return f"<bos><user>{messages[0]['content']}</user><assistant>"
+
+    def __call__(
+        self,
+        text,
+        *,
+        add_special_tokens,
+        return_offsets_mapping=False,
+    ):
+        assert add_special_tokens is False
+        token_ids = [10 + ord(character) for character in text]
+        payload = {"input_ids": token_ids}
+        if return_offsets_mapping:
+            payload["offset_mapping"] = [
+                (index, index + 1) for index in range(len(text))
+            ]
+        return type("Encoding", (), payload)()
 
 
 def test_wikitext_arrow_reader_projects_text_column(tmp_path):
@@ -105,6 +135,63 @@ def test_wikitext_preparation_preserves_article_boundaries_and_exact_length():
     assert all(len(record["token_ids"]) == 6 for record in records)
     assert len({record["article_index"] for record in records}) == 2
     assert all("-validation-" in record["sequence_id"] for record in records)
+
+
+def test_convomem_split_groups_same_profile_across_categories():
+    assert _split_for_source("stable_evidence/2_evidence/profile.json", 13) == (
+        _split_for_source("changing_evidence/5_evidence/profile.json", 13)
+    )
+
+
+def test_convomem_synthesis_inserts_exact_distractor_distance_and_answer_point():
+    source_file = "stable_evidence/2_evidence/profile.json"
+    split = _split_for_source(source_file, 13)
+    examples = [
+        ConvoMemExample(
+            example_id=f"example-{index}",
+            source_file=source_file,
+            source_item_index=index,
+            category="stable_evidence",
+            question=f"What is fact {index}?",
+            answer=f"answer-{index}",
+            evidence_context=f"User: evidence-{index}",
+            conversation_context=f"User: unrelated-conversation-{index}",
+        )
+        for index in range(4)
+    ]
+    tokenizer = _CharacterChatTokenizer()
+    rows = build_convomem_long_sequences(
+        examples,
+        tokenizer,
+        split=split,
+        sequence_length=512,
+        sequence_count=2,
+        seed=13,
+        maximum_answer_tokens=32,
+        maximum_future_horizon=16,
+    )
+    assert all(len(row["token_ids"]) == 512 for row in rows)
+    assert all(row["distractor_token_count"] > 0 for row in rows)
+    assert all(row["evidence_to_answer_distance_tokens"] > 256 for row in rows)
+    assert all(row["split_group_id"] == "convomem-profile:profile" for row in rows)
+    for row in rows:
+        answer_start = row["answer_start_position"]
+        assert row["retrieval_points"][0]["retrieval_position"] == answer_start - 2
+        record = SequenceRecord(row["sequence_id"], tuple(row["token_ids"]), row)
+        plans = build_retrieval_plans(
+            record,
+            PlanConfig(
+                local_context_length=64,
+                block_size=16,
+                future_horizon_length=16,
+                retrieval_interval=32,
+                minimum_candidate_blocks=2,
+                retrieval_point_policy="metadata",
+            ),
+        )
+        assert len(plans) == 1
+        assert plans[0].future_horizon_length == len(row["answer_token_ids"])
+        assert len(plans[0].candidate_blocks) > 16
 
 
 def test_teacher_attention_aggregation_preserves_absolute_and_conditional_mass():
@@ -239,6 +326,25 @@ def test_validation_split_is_grouped_by_sequence_id():
     train_sequences = {sample.sequence_id for sample in train.samples}
     validation_sequences = {sample.sequence_id for sample in validation.samples}
     assert train_sequences.isdisjoint(validation_sequences)
+    assert len(validation.samples) == 2
+
+
+def test_validation_split_prefers_explicit_profile_group_id():
+    samples = make_synthetic_samples(sample_count=8, residual_dim=4)
+    for index, sample in enumerate(samples):
+        sample.sequence_id = f"unique-sequence-{index}"
+        sample.logical_position_metadata["split_group_id"] = f"profile-{index // 2}"
+    train, validation = split_dataset(RetrievalDataset(samples), 0.25, seed=13)
+
+    assert validation is not None
+    train_profiles = {
+        sample.logical_position_metadata["split_group_id"] for sample in train.samples
+    }
+    validation_profiles = {
+        sample.logical_position_metadata["split_group_id"]
+        for sample in validation.samples
+    }
+    assert train_profiles.isdisjoint(validation_profiles)
     assert len(validation.samples) == 2
 
 

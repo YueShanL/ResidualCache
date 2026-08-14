@@ -135,6 +135,113 @@ def test_prepare_stage_passes_hf_ids_directly_to_python_runner(tmp_path, monkeyp
         assert "--allow-network" in arguments
 
 
+def test_convomem_hpc_preparation_uses_answer_aligned_single_points(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    config["data"] = {
+        "source": "convomem",
+        "dataset_name": "Salesforce/ConvoMem",
+        "cache_dir": None,
+        "allow_network": True,
+        "sequence_length": 4096,
+        "maximum_answer_tokens": 64,
+        "maximum_future_horizon": 16,
+        "splits": {
+            "train": {"sequences": 8},
+            "validation": {"sequences": 2},
+            "test": {"sequences": 2},
+        },
+    }
+    config["collection"]["retrieval_point_policy"] = "metadata"
+    config["collection"]["teacher_prefill_chunk_size"] = 256
+    config["data"]["splits"]["train"]["store_kv_payload"] = False
+    config["collection"].update(
+        {
+            "residual_layer": 40,
+            "query_summary": "mean",
+            "query_summary_length": 16,
+            "teacher_layers": [29, 35, 41],
+            "teacher_heads": "all",
+            "future_reduction": "mean",
+            "length_normalize_blocks": False,
+        }
+    )
+    validate_hpc_config(config)
+    pipeline = HPCPipeline(config)
+    assert pipeline._expected_samples("train") == 8
+    commands = []
+    monkeypatch.setattr(
+        pipeline,
+        "_run_command",
+        lambda stage, arguments: commands.append((stage, list(arguments))),
+    )
+    pipeline.prepare_inputs()
+    assert all(
+        arguments[1] == "learnable_index.prepare_convomem"
+        for _, arguments in commands
+    )
+    collection_arguments = pipeline._collection_arguments()
+    assert collection_arguments[
+        collection_arguments.index("--retrieval-point-policy") + 1
+    ] == "metadata"
+    assert collection_arguments[
+        collection_arguments.index("--teacher-prefill-chunk-size") + 1
+    ] == "256"
+    assert "--no-store-kv-payload" in pipeline._collection_arguments("train")
+    assert "--no-store-kv-payload" not in pipeline._collection_arguments("test")
+
+
+def test_ephemeral_inputs_are_synthesized_collected_and_removed_per_split(
+    tmp_path, monkeypatch
+):
+    config = _config(tmp_path)
+    config["_config_path"] = str(tmp_path / "config.json")
+    config["data"].update(
+        {
+            "source": "convomem",
+            "dataset_name": "Salesforce/ConvoMem",
+            "persist_prepared_inputs": False,
+        }
+    )
+    for split in ("train", "validation", "test"):
+        config["data"]["splits"][split].pop("article_stride")
+    pipeline = HPCPipeline(config)
+    events = []
+
+    def prepare(splits=("train", "validation", "test")):
+        split = tuple(splits)[0]
+        events.append(f"prepare:{split}")
+        path = pipeline._input_path(split)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}\n", encoding="utf-8")
+        path.with_suffix(".manifest.json").write_text("{}\n", encoding="utf-8")
+
+    def collect(splits=("train", "validation", "test")):
+        split = tuple(splits)[0]
+        events.append(f"collect:{split}")
+        output = pipeline._collection_dir(split)
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "collection_manifest.json").write_text("{}\n", encoding="utf-8")
+
+    monkeypatch.setattr(pipeline, "prepare_inputs", prepare)
+    monkeypatch.setattr(pipeline, "collect", collect)
+    monkeypatch.setattr(pipeline, "train", lambda: None)
+    monkeypatch.setattr(pipeline, "evaluate", lambda: None)
+    monkeypatch.setattr(pipeline, "replay", lambda: None)
+    pipeline.run()
+
+    assert events == [
+        "prepare:train",
+        "collect:train",
+        "prepare:validation",
+        "collect:validation",
+        "prepare:test",
+        "collect:test",
+    ]
+    for split in ("train", "validation", "test"):
+        assert not pipeline._input_path(split).exists()
+        assert not pipeline._input_path(split).with_suffix(".manifest.json").exists()
+
+
 def test_train_and_replay_commands_are_query_key_only(tmp_path, monkeypatch):
     pipeline = HPCPipeline(_config(tmp_path))
     commands = []
@@ -215,6 +322,32 @@ def test_wikitext4096_config_preserves_control_variables_and_full_replay():
     assert config["replay"]["maximum_samples"] is None
     assert config["paths"]["use_tmp_workspace"] is True
     assert config["paths"]["tmp_workspace_root"] == "/tmp"
+
+
+def test_convomem4096_config_is_ephemeral_and_preserves_training_controls():
+    project_root = Path(__file__).resolve().parents[1]
+    config = load_hpc_config(
+        project_root / "configs" / "learnable_index_convomem4096_hpc.json"
+    )
+    validate_hpc_config(config)
+    pipeline = HPCPipeline(config)
+
+    assert config["data"]["source"] == "convomem"
+    assert config["data"]["sequence_length"] == 4096
+    assert config["data"]["persist_prepared_inputs"] is False
+    assert config["data"]["splits"]["train"]["sequences"] == 4096
+    assert config["data"]["splits"]["validation"]["sequences"] == 295
+    assert config["data"]["splits"]["test"]["sequences"] == 290
+    assert pipeline._expected_samples("test") == 290
+    assert config["data"]["splits"]["train"]["store_kv_payload"] is False
+    assert config["data"]["splits"]["validation"]["store_kv_payload"] is False
+    assert config["data"]["splits"]["test"]["store_kv_payload"] is True
+    assert config["collection"]["retrieval_point_policy"] == "metadata"
+    assert config["collection"]["maximum_candidate_blocks"] is None
+    assert config["training"]["validation_fraction"] == pytest.approx(0.1)
+    assert config["training"]["epochs"] == 10
+    assert config["training"]["early_stopping_patience"] == 2
+    assert config["replay"]["maximum_samples"] is None
 
 
 def test_tmp_workspace_exports_only_best_model_and_training_metrics(tmp_path, monkeypatch):

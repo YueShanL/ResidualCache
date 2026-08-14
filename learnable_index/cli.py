@@ -13,6 +13,7 @@ from .planning import PlanConfig, load_sequence_records
 from .replay import ReplayConfig, evaluate_retrieval_replay
 from .retrieval import RetrievalPolicyConfig
 from .synthetic import make_synthetic_samples
+from .topn_sweep import TopNSweepConfig, evaluate_topn_sweep
 from .trainer import evaluate_model, fit_router, load_checkpoint, resolve_device
 
 
@@ -70,6 +71,21 @@ def _build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--output-dir", type=Path, required=True)
     _add_replay_arguments(replay)
 
+    sweep = subparsers.add_parser(
+        "topn-sweep",
+        help="evaluate learned/recent/random/oracle routing across fixed Top-N budgets",
+    )
+    _add_model_arguments(sweep)
+    sweep.add_argument("--collection-dir", type=Path, required=True)
+    sweep.add_argument("--checkpoint", type=Path, required=True)
+    sweep.add_argument("--output-dir", type=Path, required=True)
+    sweep.add_argument("--budgets", default="1,2,4,8")
+    sweep.add_argument("--maximum-samples", type=int)
+    sweep.add_argument("--router-device", default="cpu")
+    sweep.add_argument("--random-seed", type=int, default=13)
+    sweep.add_argument("--bootstrap-iterations", type=int, default=2000)
+    sweep.add_argument("--no-verify-query-summary", action="store_true")
+
     run = subparsers.add_parser(
         "run",
         help="collect, train, and replay the complete real-model pipeline",
@@ -111,6 +127,12 @@ def _add_collection_arguments(
     parser.add_argument("--block-size", type=int, default=32)
     parser.add_argument("--future-horizon", type=int, default=16)
     parser.add_argument("--retrieval-interval", type=int, default=32)
+    parser.add_argument(
+        "--retrieval-point-policy",
+        choices=("interval", "metadata"),
+        default="interval",
+        help="use regular interval points or answer-aligned points stored in input metadata",
+    )
     parser.add_argument("--minimum-candidate-blocks", type=int, default=1)
     parser.add_argument("--maximum-candidate-blocks", type=int)
     parser.add_argument("--residual-layer", type=int, default=-1)
@@ -119,6 +141,16 @@ def _add_collection_arguments(
     parser.add_argument("--teacher-layers", default="all")
     parser.add_argument("--teacher-heads", default="all")
     parser.add_argument("--future-reduction", choices=("mean", "sum"), default="mean")
+    parser.add_argument(
+        "--teacher-prefill-chunk-size",
+        type=int,
+        help="prefill long teacher prefixes in chunks and capture attention only for the horizon",
+    )
+    parser.add_argument(
+        "--no-store-kv-payload",
+        action="store_true",
+        help="save router summaries and labels without persistent replay KV blocks",
+    )
     parser.add_argument("--length-normalize-blocks", action="store_true")
     parser.add_argument(
         "--progress-every",
@@ -195,6 +227,7 @@ def _collection_config(arguments: argparse.Namespace) -> AlignedCollectionConfig
             retrieval_interval=arguments.retrieval_interval,
             minimum_candidate_blocks=arguments.minimum_candidate_blocks,
             maximum_candidate_blocks=arguments.maximum_candidate_blocks,
+            retrieval_point_policy=arguments.retrieval_point_policy,
         ),
         student=StudentCollectionConfig(
             local_context_length=arguments.local_context_length,
@@ -208,6 +241,8 @@ def _collection_config(arguments: argparse.Namespace) -> AlignedCollectionConfig
             future_reduction=arguments.future_reduction,
             length_normalize_blocks=arguments.length_normalize_blocks,
         ),
+        teacher_prefill_chunk_size=arguments.teacher_prefill_chunk_size,
+        store_kv_payload=not arguments.no_store_kv_payload,
     )
 
 
@@ -354,6 +389,25 @@ def _replay(arguments: argparse.Namespace) -> dict:
     )
 
 
+def _topn_sweep(arguments: argparse.Namespace) -> dict:
+    budgets = tuple(sorted({int(value) for value in arguments.budgets.split(",")}))
+    bundle = _load_bundle(arguments)
+    return evaluate_topn_sweep(
+        bundle,
+        arguments.collection_dir,
+        arguments.checkpoint,
+        arguments.output_dir,
+        TopNSweepConfig(
+            budgets=budgets,
+            maximum_samples=arguments.maximum_samples,
+            router_device=arguments.router_device,
+            random_seed=arguments.random_seed,
+            bootstrap_iterations=arguments.bootstrap_iterations,
+            verify_query_summary=not arguments.no_verify_query_summary,
+        ),
+    )
+
+
 def _run_real(arguments: argparse.Namespace) -> dict:
     bundle = _load_bundle(arguments)
     records = load_sequence_records(
@@ -431,6 +485,8 @@ def main(argv: list[str] | None = None) -> int:
         result = _collect(arguments)
     elif arguments.command == "replay":
         result = _replay(arguments)
+    elif arguments.command == "topn-sweep":
+        result = _topn_sweep(arguments)
     elif arguments.command == "run":
         result = _run_real(arguments)
     else:  # pragma: no cover - argparse enforces valid subcommands
