@@ -153,6 +153,20 @@ class HPCPipeline:
                 "PYTHONHASHSEED": str(config.get("seed", 13)),
             }
         )
+        # Node-local mode replaces HF_HOME for cache files. Preserve the token
+        # location from the original persistent HF_HOME before doing so, unless
+        # the caller already supplied HF_TOKEN or HF_TOKEN_PATH explicitly.
+        if not self.environment.get("HF_TOKEN") and not self.environment.get(
+            "HF_TOKEN_PATH"
+        ):
+            original_hf_home = Path(
+                self.environment.get(
+                    "HF_HOME", str(Path.home() / ".cache" / "huggingface")
+                )
+            ).expanduser()
+            original_token_path = original_hf_home / "token"
+            if original_token_path.is_file():
+                self.environment["HF_TOKEN_PATH"] = str(original_token_path.resolve())
         current_pythonpath = self.environment.get("PYTHONPATH", "")
         self.environment["PYTHONPATH"] = os.pathsep.join(
             part for part in (str(PROJECT_ROOT), current_pythonpath) if part

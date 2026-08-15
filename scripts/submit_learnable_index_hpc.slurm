@@ -57,7 +57,12 @@ export PIP_CACHE_DIR="/data/gpfs/projects/punim2072/LoRA_ICL_Analysis/LLM_LoRA_I
 export HF_HOME="/data/gpfs/projects/punim2072/LoRA_ICL_Analysis/LLM_LoRA_ICL_Analysis/.cache/huggingface"
 export HF_HUB_CACHE="/data/gpfs/projects/punim2072/LoRA_ICL_Analysis/LLM_LoRA_ICL_Analysis/.cache/huggingface/hub"
 export HF_DATASETS_CACHE="/data/gpfs/projects/punim2072/LoRA_ICL_Analysis/LLM_LoRA_ICL_Analysis/.cache/huggingface/datasets"
+export HF_TOKEN_PATH="${HF_TOKEN_PATH:-${HF_HOME}/token}"
 export TORCH_HOME="/data/gpfs/projects/punim2072/LoRA_ICL_Analysis/LLM_LoRA_ICL_Analysis/.cache/torch"
+
+if [[ -z "${HF_TOKEN:-}" && ! -s "${HF_TOKEN_PATH}" ]]; then
+  echo "Warning: no Hugging Face token found via HF_TOKEN or HF_TOKEN_PATH=${HF_TOKEN_PATH}" >&2
+fi
 
 echo "Project: $PROJECT_DIR"
 echo "Python: $(which python)"

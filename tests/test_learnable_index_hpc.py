@@ -290,6 +290,8 @@ def test_fixed_slurm_script_directly_launches_runner_without_resubmission():
     assert "exec sbatch" not in script
     assert "--print-sbatch-args" not in script
     assert "exec srun" not in script
+    assert 'export HF_TOKEN_PATH="${HF_TOKEN_PATH:-${HF_HOME}/token}"' in script
+    assert "cat ${HF_TOKEN_PATH}" not in script
 
 
 def test_wikitext4096_config_preserves_control_variables_and_full_replay():
@@ -385,6 +387,27 @@ def test_tmp_workspace_exports_only_best_model_and_training_metrics(tmp_path, mo
         "training/metrics.jsonl",
         "training/summary.json",
     }
+
+
+def test_tmp_workspace_preserves_token_path_from_original_hf_home(
+    tmp_path, monkeypatch
+):
+    persistent_hf_home = tmp_path / "persistent-huggingface"
+    persistent_hf_home.mkdir()
+    token_path = persistent_hf_home / "token"
+    token_path.write_text("secret-not-for-logs", encoding="utf-8")
+    monkeypatch.setenv("HF_HOME", str(persistent_hf_home))
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("HF_TOKEN_PATH", raising=False)
+    config = _config(tmp_path)
+    config["paths"]["use_tmp_workspace"] = True
+    config["paths"]["tmp_workspace_root"] = str(tmp_path / "node-local")
+
+    pipeline = HPCPipeline(config)
+
+    assert pipeline.environment["HF_TOKEN_PATH"] == str(token_path.resolve())
+    assert pipeline.environment["HF_HOME"].startswith(str(pipeline.output_root))
+    assert "secret-not-for-logs" not in repr(pipeline.environment["HF_TOKEN_PATH"])
 
 
 def test_tmp_workspace_root_must_be_absolute(tmp_path):
