@@ -21,6 +21,7 @@ from learnable_index.data import (
     split_dataset,
 )
 from learnable_index.losses import router_loss
+from learnable_index.metrics import MetricAccumulator, update_router_metrics
 from learnable_index.model import LearnableBlockIndex
 from learnable_index.prepare_wikitext import (
     _iter_arrow_texts,
@@ -274,6 +275,35 @@ def test_masked_batch_and_router_ignore_padding_candidates():
 
     assert output.scores.shape == batch.candidate_mask.shape
     assert torch.all(output.scores[~batch.candidate_mask] < -1e20)
+
+
+def test_variable_future_horizons_are_padded_and_masked_in_batch_metrics():
+    samples = make_synthetic_samples(
+        sample_count=2,
+        min_blocks=2,
+        max_blocks=2,
+        future_horizon_length=3,
+    )
+    samples[0].future_horizon_length = 2
+    samples[0].per_future_teacher_block_mass = (
+        samples[0].absolute_teacher_block_mass.repeat(2, 1)
+    )
+    samples[1].per_future_teacher_block_mass = (
+        samples[1].absolute_teacher_block_mass.repeat(3, 1)
+    )
+    batch = collate_retrieval_samples(samples)
+
+    assert batch.per_future_teacher_block_mass.shape == (2, 3, 2)
+    assert batch.per_future_mask.tolist() == [[True, True, False], [True, True, True]]
+    router = LearnableBlockIndex(RouterConfig(residual_dim=samples[0].residual_dim))
+    output = router(batch.query_summaries, batch.block_summaries, batch.candidate_mask)
+    metrics = MetricAccumulator()
+    update_router_metrics(metrics, output, batch, top_n=1)
+
+    computed = metrics.compute()
+    assert computed["historical_mass/distance_3"] == pytest.approx(
+        float(samples[1].total_teacher_historical_mass)
+    )
 
 
 def test_zero_historical_mass_skips_conditional_ranking_loss():

@@ -47,6 +47,7 @@ class RetrievalBatch:
     total_teacher_historical_mass: torch.Tensor
     conditional_teacher_distribution: torch.Tensor
     per_future_teacher_block_mass: torch.Tensor | None = None
+    per_future_mask: torch.Tensor | None = None
 
     def to(self, device: torch.device | str) -> "RetrievalBatch":
         return RetrievalBatch(
@@ -61,6 +62,9 @@ class RetrievalBatch:
                 None
                 if self.per_future_teacher_block_mass is None
                 else self.per_future_teacher_block_mass.to(device)
+            ),
+            per_future_mask=(
+                None if self.per_future_mask is None else self.per_future_mask.to(device)
             ),
         )
 
@@ -84,16 +88,16 @@ def collate_retrieval_samples(samples: Sequence[RetrievalSample]) -> RetrievalBa
     if any(per_future_present) and not all(per_future_present):
         raise ValueError("a batch cannot mix samples with and without per-future teacher mass")
     per_future = None
+    per_future_mask = None
     if all(per_future_present):
-        horizons = {sample.future_horizon_length for sample in samples}
-        if len(horizons) != 1:
-            raise ValueError("per-future batching requires a shared future horizon length")
+        max_horizon = max(sample.future_horizon_length for sample in samples)
         per_future = torch.zeros(
             batch_size,
-            samples[0].future_horizon_length,
+            max_horizon,
             max_blocks,
             dtype=torch.float32,
         )
+        per_future_mask = torch.zeros(batch_size, max_horizon, dtype=torch.bool)
     for row, sample in enumerate(samples):
         count = len(sample.candidate_blocks)
         blocks[row, :count] = sample.block_summaries.float()
@@ -101,7 +105,9 @@ def collate_retrieval_samples(samples: Sequence[RetrievalSample]) -> RetrievalBa
         absolute[row, :count] = sample.absolute_teacher_block_mass.float()
         conditional[row, :count] = sample.conditional_teacher_distribution.float()
         if per_future is not None:
-            per_future[row, :, :count] = sample.per_future_teacher_block_mass.float()
+            horizon = sample.future_horizon_length
+            per_future[row, :horizon, :count] = sample.per_future_teacher_block_mass.float()
+            per_future_mask[row, :horizon] = True
 
     return RetrievalBatch(
         sample_ids=tuple(sample.sample_id for sample in samples),
@@ -114,6 +120,7 @@ def collate_retrieval_samples(samples: Sequence[RetrievalSample]) -> RetrievalBa
         ),
         conditional_teacher_distribution=conditional,
         per_future_teacher_block_mass=per_future,
+        per_future_mask=per_future_mask,
     )
 
 

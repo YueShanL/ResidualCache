@@ -91,6 +91,11 @@ def update_router_metrics(
         accumulator.add(f"oracle_coverage@{top_n}", oracle_coverage.reshape(1))
         if batch.per_future_teacher_block_mass is not None:
             for distance_index in range(batch.per_future_teacher_block_mass.shape[1]):
+                if (
+                    batch.per_future_mask is not None
+                    and not bool(batch.per_future_mask[row, distance_index])
+                ):
+                    continue
                 distance_mass = batch.per_future_teacher_block_mass[
                     row, distance_index, :count
                 ]
