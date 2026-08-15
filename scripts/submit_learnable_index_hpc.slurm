@@ -16,7 +16,7 @@
 #SBATCH --account="punim2072"
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+#SBATCH --mem=128G
 #SBATCH --tmp=128GB
 #SBATCH --time=48:00:00
 
@@ -43,7 +43,7 @@ PROJECT_DIR="/data/gpfs/projects/punim2072/LoRA_ICL_Analysis/ResidualCache"
 
 cd "$PROJECT_DIR"
 
-CONFIG_PATH="${1:-${PROJECT_DIR}/configs/learnable_index_wikitext4096_hpc.json}"
+CONFIG_PATH="${1:-${PROJECT_DIR}/configs/learnable_index_convomem4096_hpc.json}"
 
 
 if [[ ! -f "${CONFIG_PATH}" ]]; then
@@ -56,6 +56,7 @@ source "/data/gpfs/projects/punim2072/LoRA_ICL_Analysis/LLM_LoRA_ICL_Analysis/ve
 export PIP_CACHE_DIR="/data/gpfs/projects/punim2072/LoRA_ICL_Analysis/LLM_LoRA_ICL_Analysis/.cache/pip"
 export HF_HOME="/data/gpfs/projects/punim2072/LoRA_ICL_Analysis/LLM_LoRA_ICL_Analysis/.cache/huggingface"
 export HF_HUB_CACHE="/data/gpfs/projects/punim2072/LoRA_ICL_Analysis/LLM_LoRA_ICL_Analysis/.cache/huggingface/hub"
+export HF_TOKEN_PATH="/data/gpfs/projects/punim2072/LoRA_ICL_Analysis/LLM_LoRA_ICL_Analysis/.cache/huggingface/token"
 export HF_DATASETS_CACHE="/data/gpfs/projects/punim2072/LoRA_ICL_Analysis/LLM_LoRA_ICL_Analysis/.cache/huggingface/datasets"
 export HF_TOKEN_PATH="${HF_TOKEN_PATH:-${HF_HOME}/token}"
 export TORCH_HOME="/data/gpfs/projects/punim2072/LoRA_ICL_Analysis/LLM_LoRA_ICL_Analysis/.cache/torch"
