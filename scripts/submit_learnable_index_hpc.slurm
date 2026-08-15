@@ -58,7 +58,6 @@ export HF_HOME="/data/gpfs/projects/punim2072/LoRA_ICL_Analysis/LLM_LoRA_ICL_Ana
 export HF_HUB_CACHE="/data/gpfs/projects/punim2072/LoRA_ICL_Analysis/LLM_LoRA_ICL_Analysis/.cache/huggingface/hub"
 export HF_TOKEN_PATH="/data/gpfs/projects/punim2072/LoRA_ICL_Analysis/LLM_LoRA_ICL_Analysis/.cache/huggingface/token"
 export HF_DATASETS_CACHE="/data/gpfs/projects/punim2072/LoRA_ICL_Analysis/LLM_LoRA_ICL_Analysis/.cache/huggingface/datasets"
-export HF_TOKEN_PATH="${HF_TOKEN_PATH:-${HF_HOME}/token}"
 export TORCH_HOME="/data/gpfs/projects/punim2072/LoRA_ICL_Analysis/LLM_LoRA_ICL_Analysis/.cache/torch"
 
 if [[ -z "${HF_TOKEN:-}" && ! -s "${HF_TOKEN_PATH}" ]]; then
