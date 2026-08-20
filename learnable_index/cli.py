@@ -73,7 +73,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sweep = subparsers.add_parser(
         "topn-sweep",
-        help="evaluate learned/recent/random/oracle routing across fixed Top-N budgets",
+        help="evaluate learned/oldest/recent/random/oracle routing across fixed Top-N budgets",
     )
     _add_model_arguments(sweep)
     sweep.add_argument("--collection-dir", type=Path, required=True)

@@ -148,6 +148,26 @@ greedily generates the prefix, finds the token that completes the colon, and
 captures that token's residual state. Entity/fact content after the colon is not
 included in the index vector.
 
+## WildChat Long-Conversation Learnable Index Run
+
+`allenai/WildChat-1M` is the preferred HF source for a natural long-dialogue
+training run. Its non-toxic release contains 837,989 conversations, with up to
+249 user/assistant rounds (498 messages). The preparation stage streams the
+single `train` split, makes deterministic 90/5/5 train/validation/test
+partitions, keeps conversations with at least 10 rounds, and retains only rows
+whose native chat-template encoding reaches 4096 tokens. The resulting records
+are contiguous prefixes of real conversations; no synthetic distractors or
+random insertion are used.
+
+```powershell
+..\venv\Scripts\python.exe -m learnable_index.hpc `
+  --config configs/learnable_index_wildchat4096_hpc.json
+```
+
+The preparation stage fails explicitly if a split cannot supply its requested
+number of exact-length sequences, instead of silently padding or reusing a
+conversation.
+
 ## Answer Block Cache Run
 
 `answer_block_cache` tests sparse answer-trajectory KV reuse with two independent

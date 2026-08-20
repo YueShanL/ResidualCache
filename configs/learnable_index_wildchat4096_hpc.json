@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
-  "run_id": "learnable_index_convomem_4096tokens_4096train_query_key_random_v1",
+  "run_id": "learnable_index_wildchat_4096tokens_4096train_query_key_v1",
   "seed": 13,
   "paths": {
-    "output_root": "outputs/learnable_index_convomem_4096tokens_4096train_query_key_random_v1",
+    "output_root": "outputs/learnable_index_wildchat_4096tokens_4096train_query_key_v1",
     "use_tmp_workspace": true,
     "tmp_workspace_root": "/tmp"
   },
@@ -14,19 +14,14 @@
     "allow_network": true
   },
   "data": {
-    "source": "convomem",
-    "dataset_name": "Salesforce/ConvoMem",
+    "source": "wildchat",
+    "dataset_name": "allenai/WildChat-1M",
+    "dataset_split": "train",
     "cache_dir": null,
     "allow_network": true,
-    "sequence_length": 4096,
-    "maximum_answer_tokens": 64,
-    "maximum_future_horizon": 16,
-    "evidence_placement": "stratified_random",
-    "evidence_placement_bins": 4,
-    "placement_block_size": 64,
-    "retrieval_local_context_length": 256,
-    "sampling_seed": 97,
+    "minimum_turns": 10,
     "persist_prepared_inputs": false,
+    "sequence_length": 4096,
     "splits": {
       "train": {
         "sequences": 4096,
@@ -47,7 +42,7 @@
     "block_size": 64,
     "future_horizon": 16,
     "retrieval_interval": 128,
-    "retrieval_point_policy": "metadata",
+    "retrieval_point_policy": "interval",
     "minimum_candidate_blocks": 2,
     "maximum_candidate_blocks": null,
     "teacher_prefill_chunk_size": 256,

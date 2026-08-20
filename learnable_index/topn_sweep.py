@@ -57,6 +57,16 @@ def _random_indices(sample, top_n: int, seed: int) -> tuple[int, ...]:
     return tuple(sorted(generator.sample(range(len(sample.candidate_blocks)), budget)))
 
 
+def _oldest_indices(sample, top_n: int) -> tuple[int, ...]:
+    budget = min(top_n, len(sample.candidate_blocks))
+    return tuple(
+        sorted(
+            range(len(sample.candidate_blocks)),
+            key=lambda index: sample.candidate_blocks[index].start_position,
+        )[:budget]
+    )
+
+
 def _cuda_devices(bundle) -> tuple[torch.device, ...]:
     devices = {device for device in bundle.cache_layer_devices if device.type == "cuda"}
     if bundle.input_device.type == "cuda":
@@ -135,7 +145,7 @@ def paired_comparisons(
     result: dict[str, Any] = {}
     for budget in budgets:
         learned = f"predicted_top_{budget}"
-        for baseline_name in ("recent", "random", "oracle"):
+        for baseline_name in ("recent", "oldest", "random", "oracle"):
             baseline = f"{baseline_name}_top_{budget}"
             comparison_name = f"{learned}_vs_{baseline}"
             result[comparison_name] = {}
@@ -343,6 +353,7 @@ def evaluate_topn_sweep(
             methods = {
                 "predicted": learned_order[: min(budget, len(learned_order))],
                 "recent": recent_indices(sample, budget),
+                "oldest": _oldest_indices(sample, budget),
                 "random": _random_indices(sample, budget, config.random_seed),
                 "oracle": oracle_indices(sample, budget),
             }
@@ -359,6 +370,10 @@ def evaluate_topn_sweep(
             "sample_id": sample.sample_id,
             "sequence_id": sample.sequence_id,
             "retrieval_position": sample.retrieval_position,
+            "evidence_token_ranges": record.metadata.get("evidence_token_ranges"),
+            "evidence_placement": record.metadata.get("evidence_placement"),
+            "evidence_placement_bin": record.metadata.get("evidence_placement_bin"),
+            "evidence_block_indices": record.metadata.get("evidence_block_indices"),
             "selected_block_ids": selected,
             "target_token_ids": targets.tolist(),
             "conditions": conditions,

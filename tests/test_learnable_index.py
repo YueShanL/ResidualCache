@@ -34,6 +34,10 @@ from learnable_index.prepare_convomem import (
     _split_for_source,
     build_convomem_long_sequences,
 )
+from learnable_index.prepare_wildchat import (
+    _split_for_row,
+    build_wildchat_sequences,
+)
 from learnable_index.planning import PlanConfig, SequenceRecord, build_retrieval_plans
 from learnable_index.synthetic import make_synthetic_samples
 from learnable_index.targets import aggregate_teacher_attention
@@ -70,6 +74,17 @@ class _CharacterChatTokenizer:
                 (index, index + 1) for index in range(len(text))
             ]
         return type("Encoding", (), payload)()
+
+
+class _WildChatTokenizer:
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+        assert add_generation_prompt is False
+        rendered = "\n".join(
+            f"<{message['role']}>{message['content']}" for message in messages
+        )
+        if tokenize:
+            return [10 + ord(character) for character in rendered]
+        return rendered
 
 
 def test_wikitext_arrow_reader_projects_text_column(tmp_path):
@@ -138,6 +153,35 @@ def test_wikitext_preparation_preserves_article_boundaries_and_exact_length():
     assert all("-validation-" in record["sequence_id"] for record in records)
 
 
+def test_wildchat_preparation_keeps_native_long_conversation_prefix():
+    row = {
+        "conversation_hash": "wildchat-test",
+        "turn": 10,
+        "conversation": [
+            {"role": role, "content": f"turn {index} " + "context " * 8}
+            for index in range(20)
+            for role in ("user", "assistant")
+        ],
+    }
+    split = _split_for_row(0, 13)
+    records = build_wildchat_sequences(
+        [row],
+        _WildChatTokenizer(),
+        split=split,
+        sequence_length=128,
+        sequence_count=1,
+        seed=13,
+        minimum_turns=10,
+    )
+    record = records[0]
+    assert len(record["token_ids"]) == 128
+    assert record["source"] == "allenai/WildChat-1M"
+    assert record["turn_count"] == 10
+    assert record["message_count"] == 40
+    assert record["original_token_count"] > 128
+    assert record["sequence_id"] == f"wildchat-{split}-000000000"
+
+
 def test_convomem_split_groups_same_profile_across_categories():
     assert _split_for_source("stable_evidence/2_evidence/profile.json", 13) == (
         _split_for_source("changing_evidence/5_evidence/profile.json", 13)
@@ -193,6 +237,85 @@ def test_convomem_synthesis_inserts_exact_distractor_distance_and_answer_point()
         assert len(plans) == 1
         assert plans[0].future_horizon_length == len(row["answer_token_ids"])
         assert len(plans[0].candidate_blocks) > 16
+
+
+def test_convomem_stratified_random_placement_is_neutral_and_retrievable():
+    source_file = "stable_evidence/2_evidence/profile.json"
+    split = _split_for_source(source_file, 13)
+    examples = [
+        ConvoMemExample(
+            example_id=f"example-{index}",
+            source_file=source_file,
+            source_item_index=index,
+            category="stable_evidence",
+            question=f"What is fact {index}?",
+            answer=f"answer-{index}",
+            evidence_context=f"User: evidence-{index}",
+            conversation_context=f"User: unrelated-conversation-{index}",
+        )
+        for index in range(12)
+    ]
+    tokenizer = _CharacterChatTokenizer()
+    rows = build_convomem_long_sequences(
+        examples,
+        tokenizer,
+        split=split,
+        sequence_length=768,
+        sequence_count=8,
+        seed=13,
+        sampling_seed=97,
+        maximum_answer_tokens=32,
+        maximum_future_horizon=16,
+        evidence_placement="stratified_random",
+        evidence_placement_bins=4,
+        placement_block_size=16,
+        retrieval_local_context_length=64,
+    )
+    assert [row["evidence_placement_bin"] for row in rows] == [0, 1, 2, 3] * 2
+    assert len({tuple(row["target_memory_chunk_range"]) for row in rows}) >= 4
+    mean_start_by_bin = [
+        sum(
+            row["target_memory_chunk_range"][0]
+            for row in rows
+            if row["evidence_placement_bin"] == bin_index
+        )
+        / 2
+        for bin_index in range(4)
+    ]
+    assert mean_start_by_bin == sorted(mean_start_by_bin)
+    for row in rows:
+        target_start, target_end = row["target_memory_chunk_range"]
+        assert target_start % 16 == 0
+        candidate_history_end = (
+            row["answer_start_position"] - 1 - 64
+        )
+        containing_block_end = ((target_end + 15) // 16) * 16
+        assert containing_block_end <= candidate_history_end
+        assert all(
+            target_end <= start or target_start >= end
+            for start, end in row["distractor_token_ranges"]
+            if start < end
+        )
+        rendered = "".join(chr(token - 10) for token in row["token_ids"][:-1])
+        assert "Relevant earlier conversation" not in rendered
+        assert "Intervening conversation" not in rendered
+        assert rendered.count("Memory conversation:") >= 2
+        record = SequenceRecord(row["sequence_id"], tuple(row["token_ids"]), row)
+        plan = build_retrieval_plans(
+            record,
+            PlanConfig(
+                local_context_length=64,
+                block_size=16,
+                future_horizon_length=16,
+                retrieval_interval=32,
+                minimum_candidate_blocks=2,
+                retrieval_point_policy="metadata",
+            ),
+        )[0]
+        candidate_indices = {
+                block.start_position // 16 for block in plan.candidate_blocks
+        }
+        assert set(row["evidence_block_indices"]) <= candidate_indices
 
 
 def test_teacher_attention_aggregation_preserves_absolute_and_conditional_mass():

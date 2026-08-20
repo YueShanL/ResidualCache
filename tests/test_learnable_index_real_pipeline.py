@@ -438,12 +438,15 @@ def test_fake_gemma_collect_train_and_replay_end_to_end(tmp_path):
         "predicted_top_2",
         "recent_top_1",
         "recent_top_2",
+        "oldest_top_1",
+        "oldest_top_2",
         "random_top_1",
         "random_top_2",
         "oracle_top_1",
         "oracle_top_2",
     }
     assert "predicted_top_1_vs_recent_top_1" in sweep["paired_comparisons"]
+    assert "predicted_top_1_vs_oldest_top_1" in sweep["paired_comparisons"]
     assert sweep["conditions"]["local_256"]["local_kv_bytes"] > 0
     assert sweep["conditions"]["predicted_top_1"]["total_visible_kv_bytes"] > (
         sweep["conditions"]["local_256"]["total_visible_kv_bytes"]

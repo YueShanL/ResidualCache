@@ -165,6 +165,15 @@ def test_convomem_hpc_preparation_uses_answer_aligned_single_points(tmp_path, mo
             "length_normalize_blocks": False,
         }
     )
+    config["data"].update(
+        {
+            "evidence_placement": "stratified_random",
+            "evidence_placement_bins": 4,
+            "placement_block_size": 64,
+            "retrieval_local_context_length": 256,
+            "sampling_seed": 97,
+        }
+    )
     validate_hpc_config(config)
     pipeline = HPCPipeline(config)
     assert pipeline._expected_samples("train") == 8
@@ -179,6 +188,15 @@ def test_convomem_hpc_preparation_uses_answer_aligned_single_points(tmp_path, mo
         arguments[1] == "learnable_index.prepare_convomem"
         for _, arguments in commands
     )
+    prepare_arguments = commands[0][1]
+    for flag, expected in (
+        ("--evidence-placement", "stratified_random"),
+        ("--evidence-placement-bins", "4"),
+        ("--placement-block-size", "64"),
+        ("--retrieval-local-context-length", "256"),
+        ("--sampling-seed", "97"),
+    ):
+        assert prepare_arguments[prepare_arguments.index(flag) + 1] == expected
     collection_arguments = pipeline._collection_arguments()
     assert collection_arguments[
         collection_arguments.index("--retrieval-point-policy") + 1
@@ -336,6 +354,12 @@ def test_convomem4096_config_is_ephemeral_and_preserves_training_controls():
 
     assert config["data"]["source"] == "convomem"
     assert config["data"]["sequence_length"] == 4096
+    assert config["data"]["evidence_placement"] == "stratified_random"
+    assert config["data"]["evidence_placement_bins"] == 4
+    assert config["data"]["placement_block_size"] == 64
+    assert config["data"]["retrieval_local_context_length"] == 256
+    assert config["data"]["sampling_seed"] == 97
+    assert "random" in config["run_id"]
     assert config["data"]["persist_prepared_inputs"] is False
     assert config["data"]["splits"]["train"]["sequences"] == 4096
     assert config["data"]["splits"]["validation"]["sequences"] == 295
@@ -348,6 +372,23 @@ def test_convomem4096_config_is_ephemeral_and_preserves_training_controls():
     assert config["collection"]["maximum_candidate_blocks"] is None
     assert config["training"]["validation_fraction"] == pytest.approx(0.1)
     assert config["training"]["epochs"] == 10
+
+
+def test_wildchat4096_config_uses_long_natural_conversations():
+    project_root = Path(__file__).resolve().parents[1]
+    config = load_hpc_config(
+        project_root / "configs" / "learnable_index_wildchat4096_hpc.json"
+    )
+    validate_hpc_config(config)
+    pipeline = HPCPipeline(config)
+
+    assert config["data"]["source"] == "wildchat"
+    assert config["data"]["dataset_name"] == "allenai/WildChat-1M"
+    assert config["data"]["minimum_turns"] == 10
+    assert config["data"]["sequence_length"] == 4096
+    assert config["data"]["splits"]["train"]["sequences"] == 4096
+    assert pipeline._expected_samples("train") == 118_784
+    assert config["collection"]["retrieval_point_policy"] == "interval"
     assert config["training"]["early_stopping_patience"] == 2
     assert config["replay"]["maximum_samples"] is None
 

@@ -63,8 +63,8 @@ def validate_hpc_config(config: dict[str, Any]) -> None:
             raise ValueError(f"missing config section: {section}")
     splits = config["data"].get("splits", {})
     data_source = str(config["data"].get("source", "wikitext"))
-    if data_source not in {"wikitext", "convomem"}:
-        raise ValueError("data.source must be 'wikitext' or 'convomem'")
+    if data_source not in {"wikitext", "convomem", "wildchat"}:
+        raise ValueError("data.source must be 'wikitext', 'convomem', or 'wildchat'")
     if tuple(splits) != REQUIRED_SPLITS:
         raise ValueError(f"data.splits must be ordered as {REQUIRED_SPLITS}")
     for split in REQUIRED_SPLITS:
@@ -79,6 +79,25 @@ def validate_hpc_config(config: dict[str, Any]) -> None:
     _require_hf_id(config["data"].get("dataset_name"), "data.dataset_name")
     if data_source == "wikitext" and not str(config["data"].get("dataset_config", "")).strip():
         raise ValueError("data.dataset_config must be non-empty")
+    if data_source == "wildchat":
+        if int(config["data"].get("minimum_turns", 10)) <= 0:
+            raise ValueError("data.minimum_turns must be positive")
+        if not str(config["data"].get("dataset_split", "train")).strip():
+            raise ValueError("data.dataset_split must be non-empty")
+    if data_source == "convomem":
+        evidence_placement = str(
+            config["data"].get("evidence_placement", "fixed_start")
+        )
+        if evidence_placement not in {"fixed_start", "stratified_random"}:
+            raise ValueError(
+                "data.evidence_placement must be fixed_start or stratified_random"
+            )
+        if int(config["data"].get("evidence_placement_bins", 4)) <= 0:
+            raise ValueError("data.evidence_placement_bins must be positive")
+        if int(config["data"].get("placement_block_size", 64)) <= 0:
+            raise ValueError("data.placement_block_size must be positive")
+        if int(config["data"].get("retrieval_local_context_length", 256)) <= 0:
+            raise ValueError("data.retrieval_local_context_length must be positive")
     if not isinstance(config["data"].get("persist_prepared_inputs", True), bool):
         raise ValueError("data.persist_prepared_inputs must be a boolean")
     if not 0 < float(config["training"]["validation_fraction"]) < 1:
@@ -332,6 +351,33 @@ class HPCPipeline:
                     != int(self.config["data"]["sequence_length"])
                 ):
                     raise RuntimeError(f"prepared input manifest mismatch: {manifest}")
+                if str(self.config["data"].get("source", "wikitext")) == "convomem":
+                    expected_synthesis = {
+                        "evidence_placement": self.config["data"].get(
+                            "evidence_placement", "fixed_start"
+                        ),
+                        "evidence_placement_bins": int(
+                            self.config["data"].get("evidence_placement_bins", 4)
+                        ),
+                        "placement_block_size": int(
+                            self.config["data"].get("placement_block_size", 64)
+                        ),
+                        "retrieval_local_context_length": int(
+                            self.config["data"].get(
+                                "retrieval_local_context_length", 256
+                            )
+                        ),
+                        "sampling_seed": self.config["data"].get(
+                            "sampling_seed", self.config.get("seed", 13)
+                        ),
+                    }
+                    if any(
+                        stored.get(key) != value
+                        for key, value in expected_synthesis.items()
+                    ):
+                        raise RuntimeError(
+                            f"prepared input synthesis settings mismatch: {manifest}"
+                        )
                 self._emit("stage_skip", stage=f"prepare:{split}", reason="complete")
                 continue
             if output.exists() or manifest.exists():
@@ -353,7 +399,8 @@ class HPCPipeline:
                 str(self.config.get("seed", 13)),
                 *self._huggingface_arguments(),
             ]
-            if str(self.config["data"].get("source", "wikitext")) == "convomem":
+            source = str(self.config["data"].get("source", "wikitext"))
+            if source == "convomem":
                 arguments = [
                     "-m",
                     "learnable_index.prepare_convomem",
@@ -362,6 +409,35 @@ class HPCPipeline:
                     str(self.config["data"].get("maximum_answer_tokens", 64)),
                     "--maximum-future-horizon",
                     str(self.config["data"].get("maximum_future_horizon", 16)),
+                    "--evidence-placement",
+                    str(self.config["data"].get("evidence_placement", "fixed_start")),
+                    "--evidence-placement-bins",
+                    str(self.config["data"].get("evidence_placement_bins", 4)),
+                    "--placement-block-size",
+                    str(self.config["data"].get("placement_block_size", 64)),
+                    "--retrieval-local-context-length",
+                    str(
+                        self.config["data"].get(
+                            "retrieval_local_context_length", 256
+                        )
+                    ),
+                ]
+                if self.config["data"].get("sampling_seed") is not None:
+                    arguments.extend(
+                        [
+                            "--sampling-seed",
+                            str(self.config["data"]["sampling_seed"]),
+                        ]
+                    )
+            elif source == "wildchat":
+                arguments = [
+                    "-m",
+                    "learnable_index.prepare_wildchat",
+                    *common,
+                    "--dataset-split",
+                    str(self.config["data"].get("dataset_split", "train")),
+                    "--minimum-turns",
+                    str(self.config["data"].get("minimum_turns", 10)),
                 ]
             else:
                 arguments = [
