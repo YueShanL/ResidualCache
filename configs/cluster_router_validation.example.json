@@ -1,0 +1,26 @@
+{
+  "dataset": {
+    "factory": "cluster_router_validation.adapters:jsonl_dataset_factory",
+    "kwargs": {
+      "path": "data/convomem_test.jsonl",
+      "dataset_id": "Salesforce/ConvoMem-synthetic-long",
+      "split": "test"
+    }
+  },
+  "model": {
+    "factory": "project_validation_adapters.gemma4_clustered:build_model",
+    "kwargs": {
+      "model_name": "google/gemma-4-E4B-it",
+      "router_checkpoint": "outputs/learnable_index_convomem_4096tokens_4096train_query_key_random_v1/training/best.pt",
+      "device": "cuda"
+    }
+  },
+  "output_dir": "outputs/cluster_router_validation/state",
+  "run": {
+    "budgets": [1, 2, 4, 8],
+    "fixed_policy": "recent",
+    "oracle_signal": "auto",
+    "continue_on_error": false,
+    "resume": false
+  }
+}

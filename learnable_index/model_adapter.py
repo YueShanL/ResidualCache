@@ -98,6 +98,7 @@ def load_frozen_gemma(
     device: str = "auto",
     dtype: str = "auto",
     local_files_only: bool = True,
+    cache_dir: str | None = None,
 ) -> ModelBundle:
     try:
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -110,6 +111,8 @@ def load_frozen_gemma(
         "dtype": _dtype_from_name(dtype),
         "attn_implementation": "eager",
     }
+    if cache_dir is not None:
+        load_kwargs["cache_dir"] = cache_dir
     if device == "auto":
         load_kwargs["device_map"] = "auto"
     model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
@@ -126,6 +129,7 @@ def load_frozen_gemma(
     input_device = text_model(model).embed_tokens.weight.device
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
+        cache_dir=cache_dir,
         local_files_only=local_files_only,
         trust_remote_code=False,
     )
@@ -169,6 +173,26 @@ def cache_from_layer_kv(layer_kv: Iterable[tuple[torch.Tensor, torch.Tensor]]):
 
     pairs = tuple((key, value) for key, value in layer_kv)
     return DynamicCache(ddp_cache_data=pairs)
+
+
+def cache_suffix(cache, maximum_length: int):
+    """Return a dynamic cache containing only the newest physical K/V tokens.
+
+    Transformers' ``DynamicCache.crop`` retains the *prefix*.  A strict rolling
+    local context needs the opposite operation, so this helper creates a new
+    cache from suffix views without copying the underlying K/V tensors.
+    """
+
+    if maximum_length <= 0:
+        raise ValueError("maximum_length must be positive")
+    pairs = layer_kv_from_cache(cache)
+    length = int(pairs[0][0].shape[2])
+    if length <= maximum_length:
+        return cache
+    return cache_from_layer_kv(
+        (key[:, :, -maximum_length:, :], value[:, :, -maximum_length:, :])
+        for key, value in pairs
+    )
 
 
 def layer_kv_from_cache(cache) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
@@ -289,6 +313,46 @@ def build_sparse_prefix_mask(
     return {layer_type: mask for layer_type in layer_types}
 
 
+def build_rolling_local_mask(
+    bundle: ModelBundle,
+    *,
+    past_positions: Iterable[int],
+    query_positions: Iterable[int],
+    local_context_length: int,
+):
+    """Build an exact logical-position mask for a chunked rolling local cache.
+
+    ``local_context_length`` counts the current query token, matching a direct
+    forward over the final ``L`` tokens.  Batched query tokens therefore see
+    neither future tokens in their chunk nor native keys older than ``L - 1``.
+    """
+
+    if local_context_length <= 0:
+        raise ValueError("local_context_length must be positive")
+    past = tuple(int(value) for value in past_positions)
+    query = tuple(int(value) for value in query_positions)
+    if not query:
+        raise ValueError("query_positions must be non-empty")
+    combined = past + query
+    if any(right != left + 1 for left, right in zip(combined, combined[1:])):
+        raise ValueError("rolling cache positions must be contiguous")
+    embedding = bundle.text_model.embed_tokens.weight
+    dtype = embedding.dtype if torch.is_floating_point(embedding) else torch.float32
+    device = bundle.input_device
+    key_positions = torch.tensor(combined, device=device, dtype=torch.long)
+    query_tensor = torch.tensor(query, device=device, dtype=torch.long)
+    allowed = (
+        (key_positions[None, :] <= query_tensor[:, None])
+        & (key_positions[None, :] > query_tensor[:, None] - local_context_length)
+    )
+    minimum = torch.finfo(dtype).min
+    mask = torch.zeros(
+        (1, 1, len(query), len(combined)), device=device, dtype=dtype
+    ).masked_fill(~allowed.view(1, 1, len(query), len(combined)), minimum)
+    layer_types = set(getattr(bundle.text_config, "layer_types", ["full_attention"]))
+    return {layer_type: mask for layer_type in layer_types}
+
+
 def forward_tokens(
     bundle: ModelBundle,
     token_ids: Iterable[int],
@@ -299,6 +363,7 @@ def forward_tokens(
     use_cache: bool,
     output_hidden_states: bool = False,
     output_attentions: bool = False,
+    logical_cache_position: bool = False,
 ):
     token_list = list(token_ids)
     position_list = list(logical_positions)
@@ -315,6 +380,8 @@ def forward_tokens(
         "output_hidden_states": output_hidden_states,
         "output_attentions": output_attentions,
     }
+    if logical_cache_position:
+        kwargs["cache_position"] = position_ids[0]
     if attention_mask is not None:
         kwargs["attention_mask"] = attention_mask
     with torch.inference_mode():

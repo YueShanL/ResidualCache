@@ -1,0 +1,6 @@
+{
+  "distance_boundaries": [1024, 2048, 4096, 8192],
+  "length_boundaries": [4096, 8192, 16384],
+  "kv_ratio_thresholds": [0.25, 0.5],
+  "allow_incomplete_state": false
+}

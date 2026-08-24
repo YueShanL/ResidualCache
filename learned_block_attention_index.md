@@ -676,6 +676,106 @@ implementations for KV slicing, cache validation, logical positions, prefix
 masks, and layer-online memory visibility. The learned router should remain a
 separate pipeline until its data and inference contracts are validated.
 
+### Independent clustered-memory bridge
+
+The validated query/key router is integrated with the probabilistic memory
+through the standalone `cluster_router_bridge` package. The dependency boundary
+is deliberately one-way: neither `learnable_index` nor `residual_cache` imports
+the bridge or each other.
+
+The memory continues to classify, split, merge, retain, and evict records using
+only its native K/V-derived statistics. A learned block key is stored inside
+`MemoryRecord` as opaque read-index metadata during a successful write. For a
+block with `N` records in one layer, every retained record contributes weight
+`1/N` to the router-key vMF cached on its current `LeafSlot`. These weights
+never alter native effective counts, assignment, retention, utility, attention
+multiplicity, or split/merge decisions.
+
+The leaf router-vMF is derived from the leaf's actual `record_ids`, not managed
+by the bridge. A record that fails to enter memory contributes nothing; an
+evicted record disappears on refresh; split and merge rebuild the distribution
+from the resulting children or combined leaf. At a retrieval point, the
+memory's pure read API ranks current leaf distributions independently for each
+layer and returns every current record ID in each selected leaf. The bridge
+then packs those records into a layer-specific K/V prefix with original logical
+positions. Different layers may expose different historical token counts while
+retaining one attention matrix multiplication per layer.
+
+### End-to-end clustered-router validation
+
+Actual model quality is evaluated by the independent
+`cluster_router_validation` package. Its collection runner owns the comparison
+policy and invokes a dataset adapter plus a model session for full context,
+an unconstrained evidence-only upper bound, local-only context, recent-cluster
+retrieval, learned-router retrieval, and oracle-cluster retrieval at identical
+per-layer budgets. The evidence-only condition exposes the correct source
+context as the sole non-local history and is deliberately independent of
+memory retention, clustering, and Top-N. It therefore does not replace either
+full context or the cluster-constrained oracle. The model adapter is responsible
+for constructing the real memory and replaying a supplied cluster selection,
+but cannot redefine how the comparison policies rank candidates.
+
+Collection writes a versioned manifest and one JSONL state row per sample. Each
+row contains the current leaf/record membership, evidence and teacher-attention
+overlap, generated answer, compact teacher-forced distribution statistics,
+per-layer visible KV lengths, KV bytes, CUDA peaks, and latency. Full-vocabulary
+logits remain transient. A separate metric command consumes only these state
+files to compute answer EM/F1, normalized quality recovery, NLL/KL agreement,
+evidence and attention coverage, cluster amplification, layer-token KV ratios,
+distance/length breakdowns, and the quality-memory Pareto frontier. This allows
+metric definitions to change without rerunning the language model.
+
+The concrete local validation composition lives in the separate
+`cluster_router_experiment` package. It dynamically synthesizes 256 test cases
+from the same stratified-random ConvoMem split at exactly 4096 tokens, loads the
+random-position query/key checkpoint, and augments only Gemma 4 full-attention
+layers. Native sliding-attention windows are not widened. Its committed config
+is `configs/cluster_router_validation_convomem4096_256.json`; synthesized rows
+exist only in process memory. Full context, evidence-only, local-only,
+recent-cluster Top-4, learned-router Top-4, and evidence-oracle-cluster Top-4
+are all retained as distinct conditions. Answer logits are teacher-forced and
+the decoded prediction is the aligned per-position argmax over the complete
+gold-answer length, matching the distributional NLL/KL evaluation contract.
+
+The concrete ingestion path is online rather than a separate all-context
+collection pass. Gemma retains 256 tokens, appends one 64-token mechanical
+block, and allows that forward's context to grow to 320. At that fixed limit it
+encodes the completed newest block's layer-40 residual summary, unloads the
+oldest 64-token block, and returns the retained cache to 256. Retrieval points
+need not be block aligned; the final partial input/unload span is handled as one
+smaller transaction.
+
+Each selected physical full-attention layer owns a fixed-budget GPU database.
+Original K/V records, native vMF resultants/counts, router-vMF statistics,
+posterior scoring, write updates, and eviction subtraction remain on GPU. A
+compact CPU locality index maps GPU-produced random-hyperplane codes to at most
+`candidate_capacity` active slot IDs; only that bounded ID list returns to GPU
+for exact assignment. CPU does not receive K/V, resultants, or posterior
+vectors, and ingestion never scans all active clusters. Every record in an
+unloaded block receives its own posterior, but all 64 posteriors are evaluated
+against the same pre-commit memory state and their sufficient statistics commit
+together (`write_chunk_size = block_size = 64`). State rows record
+`rolling_forward_calls`, `rolling_forwarded_tokens`, candidate maxima,
+`global_assignment_scans`, numerical device, and exact allocated/budget bytes
+so this constraint is externally auditable.
+
+The scheduler-facing composition is
+`scripts/run_cluster_router_validation_hpc.py`, configured by
+`configs/cluster_router_validation_convomem4096_hpc.json`. It adds the trained
+query/key checkpoint as `router.path` while keeping the Gemma and ConvoMem
+inputs as Hugging Face IDs. In node-local mode, model/dataset caches, generated
+collection config, state JSONL, and transient database state stay below the
+configurable temporary root. Successful metrics-only export retains exactly
+the aggregate JSON, per-sample JSONL, and condition CSV; cleanup then removes
+the verified temporary job workspace.
+
+The committed 256-case configuration uses a 4 MiB hard allocation per physical
+full-attention layer. This is deliberately capacity constrained and may evict
+early evidence in a 4096-token example; quality reports must therefore include
+both evidence retention/coverage and the exact retained-record count. A larger
+budget is a separate retention sensitivity run, not a hidden change to router
+quality.
+
 ## Decision Log
 
 The following decisions are fixed for the first implementation:

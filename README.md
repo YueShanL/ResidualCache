@@ -17,6 +17,27 @@ target fact better than chance.
 - `learnable_index/`: standalone learned block-attention index contracts,
   router, trainer, metrics, and offline smoke CLI. It does not import the
   existing `residual_cache` package.
+- `cluster_router_bridge/`: independent integration which splits blocks,
+  transports learned keys into memory-owned record metadata, invokes the
+  memory-owned per-leaf router-vMF index, and packs selected clusters into
+  variable-length per-layer K/V views. Neither existing package imports this
+  bridge.
+- `cluster_router_validation/`: independent state-collection runner and offline
+  metrics for full-context, local-only, recent, learned-router, and oracle-cluster
+  comparisons. Dataset and model implementations are injected through factory
+  interfaces, while the intermediate JSONL schema keeps expensive replay
+  separate from metric iteration. Its config-driven HPC wrapper can keep all
+  collection state in node-local temporary storage and persist only metrics.
+- `cluster_router_experiment/`: concrete Gemma 4/ConvoMem composition. It runs a
+  256-token retained cache that grows to 320 while one new 64-token block is
+  evaluated. It prepares the learned block key, unloads the oldest block, and
+  writes that block as one pre-commit transaction.
+- `residual_cache/gpu_local_cluster_memory.py`: fixed-budget GPU K/V records and
+  GPU vMF sufficient statistics. During ingestion, CPU locality lookup returns
+  at most `candidate_capacity` slot IDs; exact posterior assignment and every
+  numerical update are executed only on those GPU slots. Every record has its
+  own posterior, but records from one unloaded block share the same pre-commit
+  state and commit together. No ingestion path scans every active cluster.
 - `learned_block_attention_index.md`: development specification for the
   learned prompt-free block-attention index over historical KV-cache records.
 

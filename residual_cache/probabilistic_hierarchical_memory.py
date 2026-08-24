@@ -201,6 +201,16 @@ class MemoryConfig:
     minimum_concentration: float = 0.0
     maximum_concentration: float = 1_000.0
 
+    # A learned router key is an opaque read index.  These parameters affect
+    # only ``retrieve_router_clusters``; they are deliberately separate from
+    # the native K/V posterior and never participate in write assignment,
+    # retention, split, or merge decisions.
+    router_count_exponent: float = 0.5
+    router_count_epsilon: float = 1e-6
+    router_concentration_prior_mass: float = 1.0
+    router_minimum_concentration: float = 0.0
+    router_maximum_concentration: float = 1_000.0
+
     use_temporal_weights: bool = True
     age_decay: float = 0.0
     inactivity_decay: float = 0.0
@@ -251,6 +261,18 @@ class MemoryConfig:
             raise ValueError("concentration_prior_mass cannot be negative.")
         if not 0.0 <= self.minimum_concentration <= self.maximum_concentration:
             raise ValueError("Invalid concentration bounds.")
+        if not 0.0 <= self.router_count_exponent < 1.0:
+            raise ValueError("router_count_exponent must be in [0, 1).")
+        if self.router_count_epsilon <= 0.0:
+            raise ValueError("router_count_epsilon must be positive.")
+        if self.router_concentration_prior_mass < 0.0:
+            raise ValueError("router_concentration_prior_mass cannot be negative.")
+        if not (
+            0.0
+            <= self.router_minimum_concentration
+            <= self.router_maximum_concentration
+        ):
+            raise ValueError("Invalid router concentration bounds.")
         if self.age_decay < 0.0 or self.inactivity_decay < 0.0:
             raise ValueError("Decay rates cannot be negative.")
         if self.gain_exponent < 0.0:
@@ -288,6 +310,10 @@ class MemoryRecord:
     conflict_group: Hashable | None = None
     source_authority: float = 0.0
     multiplicity: int = 1
+    router_key: Vector | None = None
+    router_block_id: Hashable | None = None
+    router_block_size: int | None = None
+    router_weight: float = 0.0
 
     def approximate_bytes(self) -> int:
         vector_bytes = 8 * (
@@ -314,6 +340,20 @@ class LeafSlot:
     pending_split_observations: int = 0
     parent_id: str | None = None
     cooldown_until: float = -math.inf
+    # Derived exclusively from router metadata on the records currently in
+    # ``record_ids``.  This is cached inside the leaf so eviction and topology
+    # changes cannot leave a detached adapter-side distribution behind.
+    router_dimension: int = 0
+    router_record_count: int = 0
+    router_block_count: int = 0
+    router_mass: float = 0.0
+    router_resultant: Vector = field(default_factory=tuple)
+    router_mean_direction: Vector = field(default_factory=tuple)
+    router_resultant_length: float = 0.0
+    router_concentration: float = 0.0
+    router_block_weights: tuple[tuple[Hashable, float], ...] = field(
+        default_factory=tuple
+    )
 
 
 @dataclass
@@ -350,6 +390,23 @@ class RetrievalResult:
     write_time: float
     source_authority: float
     multiplicity: int = 1
+
+
+@dataclass(frozen=True)
+class RouterClusterResult:
+    """One leaf posterior under the opaque learned-router read index."""
+
+    slot_id: str
+    layer: int
+    head_or_kv_group: Hashable
+    probability: float
+    log_score: float
+    record_ids: tuple[str, ...]
+    router_record_count: int
+    router_block_count: int
+    router_mass: float
+    mean_direction: Vector
+    concentration: float
 
 
 @dataclass(frozen=True)
@@ -462,6 +519,7 @@ class ProbabilisticHierarchicalMemory:
             if record_id in self.records
         ]
         slot.record_ids = [record.id for record in all_members]
+        self._refresh_leaf_router_index(slot, all_members)
         members = [
             record
             for record in all_members
@@ -514,6 +572,79 @@ class ProbabilisticHierarchicalMemory:
             max(record.write_time for record in members),
         )
         slot.value_conflict_score = self._value_conflict(members, weights)
+
+    def _refresh_leaf_router_index(
+        self, slot: LeafSlot, members: Sequence[MemoryRecord]
+    ) -> None:
+        """Rebuild the learned-router vMF from physically retained members.
+
+        Router weights are intentionally independent of temporal/native record
+        weights.  A record contributes exactly while it is a member of this
+        leaf, and contributes ``1 / router_block_size`` so repeating one block
+        key for every token does not multiply that block's total evidence.
+        """
+
+        routed = [record for record in members if record.router_key is not None]
+        if not routed:
+            slot.router_dimension = 0
+            slot.router_record_count = 0
+            slot.router_block_count = 0
+            slot.router_mass = 0.0
+            slot.router_resultant = ()
+            slot.router_mean_direction = ()
+            slot.router_resultant_length = 0.0
+            slot.router_concentration = 0.0
+            slot.router_block_weights = ()
+            return
+
+        dimension = len(routed[0].router_key or ())
+        if dimension < 2 or any(
+            len(record.router_key or ()) != dimension for record in routed
+        ):
+            raise ValueError("router key dimensions must be constant within a leaf.")
+        block_weights: dict[Hashable, float] = {}
+        weighted_keys: list[tuple[float, Vector]] = []
+        for record in routed:
+            assert record.router_key is not None
+            assert record.router_block_id is not None
+            weight = record.router_weight
+            if weight <= 0.0 or not math.isfinite(weight):
+                raise ValueError("router record weights must be finite and positive.")
+            weighted_keys.append((weight, record.router_key))
+            block_weights[record.router_block_id] = (
+                block_weights.get(record.router_block_id, 0.0) + weight
+            )
+
+        resultant = _weighted_sum(weighted_keys, dimension)
+        mass = math.fsum(weight for weight, _key in weighted_keys)
+        resultant_norm = _norm(resultant)
+        mean_direction = (
+            tuple(value / resultant_norm for value in resultant)
+            if resultant_norm > 1e-15
+            else tuple(0.0 for _ in range(dimension))
+        )
+        shrunken_resultant = resultant_norm / (
+            mass + self.config.router_concentration_prior_mass
+        )
+        concentration = 0.0
+        if resultant_norm > 1e-15:
+            concentration = estimate_vmf_concentration(
+                min(1.0, shrunken_resultant),
+                dimension,
+                minimum=self.config.router_minimum_concentration,
+                maximum=self.config.router_maximum_concentration,
+            )
+        slot.router_dimension = dimension
+        slot.router_record_count = len(routed)
+        slot.router_block_count = len(block_weights)
+        slot.router_mass = mass
+        slot.router_resultant = resultant
+        slot.router_mean_direction = mean_direction
+        slot.router_resultant_length = min(1.0, resultant_norm / mass)
+        slot.router_concentration = concentration
+        slot.router_block_weights = tuple(
+            sorted(block_weights.items(), key=lambda item: repr(item[0]))
+        )
 
     @staticmethod
     def _value_conflict(records: Sequence[MemoryRecord], weights: Sequence[float]) -> float:
@@ -603,8 +734,16 @@ class ProbabilisticHierarchicalMemory:
         counterfactual_gain: float = 1.0,
         active_weight: float = 1.0,
         multiplicity: int = 1,
+        router_key: Sequence[float] | None = None,
+        router_block_id: Hashable | None = None,
+        router_block_size: int | None = None,
     ) -> WriteDecision:
-        """Write one historical record and return the explicit posterior decision."""
+        """Write one historical record and return the native posterior decision.
+
+        ``router_*`` fields are opaque read-index metadata stored on the record.
+        They are validated before the write but never used by the assignment
+        posterior or any native memory maintenance policy.
+        """
 
         now = self._next_time(time)
         index = _normalize(index_vector, name="index_vector")
@@ -620,6 +759,37 @@ class ProbabilisticHierarchicalMemory:
             raise ValueError("multiplicity must be positive.")
         if supersedes is not None and supersedes not in self.records:
             raise KeyError(f"Unknown superseded record {supersedes!r}.")
+        router_direction: Vector | None = None
+        router_weight = 0.0
+        if router_key is None:
+            if router_block_id is not None or router_block_size is not None:
+                raise ValueError(
+                    "router_block_id and router_block_size require router_key."
+                )
+        else:
+            router_direction = _normalize(router_key, name="router_key")
+            if len(router_direction) < 2:
+                raise ValueError("router_key dimension must be at least 2.")
+            if router_block_id is None:
+                raise ValueError("router_block_id is required with router_key.")
+            hash(router_block_id)
+            if (
+                not isinstance(router_block_size, int)
+                or isinstance(router_block_size, bool)
+                or router_block_size <= 0
+            ):
+                raise ValueError("router_block_size must be a positive integer.")
+            for existing_record in self.records.values():
+                if (
+                    existing_record.layer == layer
+                    and existing_record.head_or_kv_group == head_or_kv_group
+                    and existing_record.router_key is not None
+                    and len(existing_record.router_key) != len(router_direction)
+                ):
+                    raise ValueError(
+                        "router_key dimension must be constant within a layer/group."
+                    )
+            router_weight = 1.0 / router_block_size
 
         self._refresh_all(now)
         candidates = [
@@ -664,6 +834,10 @@ class ProbabilisticHierarchicalMemory:
             conflict_group=conflict_group,
             source_authority=float(source_authority),
             multiplicity=multiplicity,
+            router_key=router_direction,
+            router_block_id=router_block_id,
+            router_block_size=router_block_size,
+            router_weight=router_weight,
         )
         self.records[record_id] = record
 
@@ -696,6 +870,81 @@ class ProbabilisticHierarchicalMemory:
                 )
             ),
         )
+
+    def retrieve_router_clusters(
+        self,
+        query_router_key: Sequence[float],
+        *,
+        layer: int = 0,
+        head_or_kv_group: Hashable = 0,
+        top_n: int = 4,
+    ) -> list[RouterClusterResult]:
+        """Rank current leaves by the learned block-router posterior.
+
+        This operation is a pure read over leaf-local cached statistics.  It
+        neither advances the memory clock nor updates native usage, routing,
+        retention, split, or merge state.  Returned ``record_ids`` include all
+        currently retained records in a selected leaf so callers can replay
+        the complete cluster, including records without router metadata.
+        """
+
+        if top_n <= 0:
+            raise ValueError("top_n must be positive.")
+        query = _normalize(query_router_key, name="query_router_key")
+        if len(query) < 2:
+            raise ValueError("query_router_key dimension must be at least 2.")
+        candidates = [
+            slot
+            for slot in self.leaves.values()
+            if self._compatible(slot, layer, head_or_kv_group)
+            and slot.router_record_count > 0
+        ]
+        if not candidates:
+            return []
+        dimensions = {slot.router_dimension for slot in candidates}
+        if dimensions != {len(query)}:
+            raise ValueError(
+                "query_router_key dimension differs from retained router keys."
+            )
+
+        scored: list[tuple[float, LeafSlot]] = []
+        for slot in candidates:
+            density = vmf_log_normalizer(
+                slot.router_dimension, slot.router_concentration
+            )
+            if slot.router_concentration > 0.0:
+                density += slot.router_concentration * _dot(
+                    query, slot.router_mean_direction
+                )
+            log_score = (
+                self.config.router_count_exponent
+                * math.log(slot.router_mass + self.config.router_count_epsilon)
+                + density
+            )
+            scored.append((log_score, slot))
+
+        normalizer = _logsumexp([score for score, _slot in scored])
+        scored.sort(key=lambda item: (-item[0], item[1].id))
+        return [
+            RouterClusterResult(
+                slot_id=slot.id,
+                layer=slot.layer,
+                head_or_kv_group=slot.head_or_kv_group,
+                probability=math.exp(score - normalizer),
+                log_score=score,
+                record_ids=tuple(
+                    record_id
+                    for record_id in slot.record_ids
+                    if record_id in self.records
+                ),
+                router_record_count=slot.router_record_count,
+                router_block_count=slot.router_block_count,
+                router_mass=slot.router_mass,
+                mean_direction=slot.router_mean_direction,
+                concentration=slot.router_concentration,
+            )
+            for score, slot in scored[:top_n]
+        ]
 
     def _root_nodes(self, layer: int, group: Hashable) -> list[LeafSlot | ParentSlot]:
         nodes: list[LeafSlot | ParentSlot] = [*self.leaves.values(), *self.parents.values()]
@@ -1320,6 +1569,11 @@ class ProbabilisticHierarchicalMemory:
                     "weighted_scatter": slot.weighted_scatter,
                     "routing_regret_ema": slot.routing_regret_ema,
                     "value_conflict_score": slot.value_conflict_score,
+                    "router_record_count": slot.router_record_count,
+                    "router_block_count": slot.router_block_count,
+                    "router_mass": slot.router_mass,
+                    "router_resultant_length": slot.router_resultant_length,
+                    "router_concentration": slot.router_concentration,
                 }
                 for slot in sorted(self.leaves.values(), key=lambda item: item.id)
             ],

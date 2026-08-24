@@ -228,8 +228,7 @@ class Gemma4MemoryController:
             raise ValueError("Gemma eager attention requires a four-dimensional mask.")
         if attention_mask.shape[-1] != native_key_length:
             raise ValueError(
-                "Memory evaluation requires use_cache=False and a mask matching "
-                "the current window's native K/V length."
+                "Memory evaluation requires a mask matching the native K/V length."
             )
         prefix = torch.zeros(
             (
@@ -328,6 +327,122 @@ class Gemma4MemoryController:
         }
 
 
+class Gemma4StaticKVController:
+    """Inject a preselected, variable-length historical K/V view per layer.
+
+    Unlike :class:`Gemma4MemoryController`, this controller neither retrieves
+    from nor writes to a memory bank.  It is the narrow execution boundary used
+    after an external policy has selected complete memory clusters.  Gemma 4's
+    KV-sharing decoder layers are mapped back to the final physical cache layer
+    of the same attention type, matching the model's native ``shared_kv_states``
+    behavior.
+    """
+
+    def __init__(self, layer_kv: dict[int, tuple[Any, Any]]):
+        self.layer_kv = {int(layer): pair for layer, pair in layer_kv.items()}
+        if any(layer < 0 for layer in self.layer_kv):
+            raise ValueError("static K/V layer indices must be non-negative")
+        self.layer_calls: dict[int, int] = {}
+        self.retrieved_tokens_by_layer: dict[int, int] = {}
+
+    @staticmethod
+    def physical_source_layer(module) -> int:
+        layer_index = int(module.layer_idx)
+        if not bool(getattr(module, "is_kv_shared_layer", False)):
+            return layer_index
+        first_shared = int(module.config.num_hidden_layers) - int(
+            getattr(module.config, "num_kv_shared_layers", 0)
+        )
+        previous_types = list(module.config.layer_types[:first_shared])
+        try:
+            reverse_offset = previous_types[::-1].index(module.layer_type)
+        except ValueError as error:
+            raise ValueError(
+                f"no physical source layer exists for attention type {module.layer_type!r}"
+            ) from error
+        return len(previous_types) - 1 - reverse_offset
+
+    def attend(
+        self,
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        *,
+        dropout: float,
+        scaling: float | None,
+        softcap: float | None,
+    ):
+        torch, _functional = _require_torch()
+        source_layer = self.physical_source_layer(module)
+        historical = self.layer_kv.get(source_layer)
+        if historical is None:
+            return eager_attention_reference(
+                module,
+                query,
+                key,
+                value,
+                attention_mask,
+                dropout=dropout,
+                scaling=scaling,
+                softcap=softcap,
+            )
+        historical_key, historical_value = historical
+        if historical_key.ndim != 4 or historical_value.shape != historical_key.shape:
+            raise ValueError("static historical K/V must have shape [batch, heads, tokens, dim]")
+        if (
+            historical_key.shape[0] != key.shape[0]
+            or historical_key.shape[1] != key.shape[1]
+            or historical_key.shape[3] != key.shape[3]
+        ):
+            raise ValueError(
+                f"static historical K/V is incompatible with layer {source_layer}"
+            )
+        historical_key = historical_key.to(device=key.device, dtype=key.dtype)
+        historical_value = historical_value.to(device=value.device, dtype=value.dtype)
+        valid = torch.ones(
+            (key.shape[0], historical_key.shape[2]),
+            dtype=torch.bool,
+            device=query.device,
+        )
+        augmented_mask = Gemma4MemoryController._prepend_mask(
+            attention_mask,
+            valid,
+            query=query,
+            native_key_length=key.shape[2],
+        )
+        output = eager_attention_reference(
+            module,
+            query,
+            torch.cat((historical_key, key), dim=2),
+            torch.cat((historical_value, value), dim=2),
+            augmented_mask,
+            dropout=dropout,
+            scaling=scaling,
+            softcap=softcap,
+        )
+        layer_index = int(module.layer_idx)
+        self.layer_calls[layer_index] = self.layer_calls.get(layer_index, 0) + 1
+        self.retrieved_tokens_by_layer[source_layer] = (
+            self.retrieved_tokens_by_layer.get(source_layer, 0)
+            + int(historical_key.shape[0] * historical_key.shape[2])
+        )
+        return output
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "layer_calls": dict(sorted(self.layer_calls.items())),
+            "retrieved_tokens_by_physical_layer": dict(
+                sorted(self.retrieved_tokens_by_layer.items())
+            ),
+            "visible_tokens_by_physical_layer": {
+                str(layer): int(key.shape[0] * key.shape[2])
+                for layer, (key, _value) in sorted(self.layer_kv.items())
+            },
+        }
+
+
 def _gemma4_text_attention_modules(model) -> list[Any]:
     modules = [
         module
@@ -396,6 +511,49 @@ class Gemma4MemoryAdapter:
         return False
 
 
+class Gemma4StaticKVAdapter:
+    """Temporarily inject externally selected historical K/V into Gemma 4."""
+
+    def __init__(self, model, layer_kv: dict[int, tuple[Any, Any]]):
+        self.model = model
+        self.controller = Gemma4StaticKVController(layer_kv)
+        self.modules = [
+            module
+            for module in _gemma4_text_attention_modules(model)
+            if self.controller.physical_source_layer(module) in self.controller.layer_kv
+        ]
+        self._saved_implementations: dict[int, tuple[Any, Any]] = {}
+        self._active = False
+
+    def __enter__(self):
+        if self._active:
+            raise RuntimeError("Gemma4StaticKVAdapter cannot be entered twice.")
+        register_attention_backend()
+        with _CONTROLLER_LOCK:
+            for module in self.modules:
+                config = module.config
+                config_id = id(config)
+                if config_id not in self._saved_implementations:
+                    self._saved_implementations[config_id] = (
+                        config,
+                        config._attn_implementation,
+                    )
+                _CONTROLLERS[module] = self.controller
+                config._attn_implementation = ATTENTION_BACKEND_NAME
+        self._active = True
+        return self.controller
+
+    def __exit__(self, exc_type, exc, traceback):
+        with _CONTROLLER_LOCK:
+            for module in self.modules:
+                _CONTROLLERS.pop(module, None)
+            for config, implementation in self._saved_implementations.values():
+                config._attn_implementation = implementation
+        self._saved_implementations.clear()
+        self._active = False
+        return False
+
+
 def parse_augmented_layers(specification: str | None) -> tuple[int, ...] | None:
     if specification is None or specification.strip().lower() in {"", "all"}:
         return None
@@ -418,6 +576,8 @@ __all__ = [
     "Gemma4MemoryAdapter",
     "Gemma4MemoryAdapterConfig",
     "Gemma4MemoryController",
+    "Gemma4StaticKVAdapter",
+    "Gemma4StaticKVController",
     "eager_attention_reference",
     "parse_augmented_layers",
     "register_attention_backend",

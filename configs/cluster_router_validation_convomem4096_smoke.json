@@ -1,0 +1,59 @@
+{
+  "dataset": {
+    "factory": "cluster_router_experiment.convomem:dynamic_convomem_dataset_factory",
+    "kwargs": {
+      "dataset_name": "Salesforce/ConvoMem",
+      "tokenizer_name": "google/gemma-4-E4B-it",
+      "dataset_cache_dir": "E:/huggingface/hub",
+      "tokenizer_cache_dir": "outputs/hf_cache/hub",
+      "local_files_only": true,
+      "split": "test",
+      "sequence_count": 1,
+      "sequence_length": 4096,
+      "seed": 13,
+      "sampling_seed": 97,
+      "maximum_answer_tokens": 64,
+      "maximum_future_horizon": 64,
+      "evidence_placement_bins": 4,
+      "block_size": 64,
+      "local_context_length": 256
+    }
+  },
+  "model": {
+    "factory": "cluster_router_experiment.gemma4:gemma4_cluster_router_model_factory",
+    "kwargs": {
+      "checkpoint_path": "outputs/learnable_index_convomem_4096tokens_4096train_query_key_random_v1/training/best.pt",
+      "model_name": "google/gemma-4-E4B-it",
+      "model_cache_dir": "outputs/hf_cache/hub",
+      "local_files_only": true,
+      "device": "cuda",
+      "dtype": "bfloat16",
+      "router_device": "cuda",
+      "block_size": 64,
+      "local_context_length": 256,
+      "residual_layer": 40,
+      "query_summary_length": 16,
+      "prefill_chunk_size": 64,
+      "memory_budget_bytes_per_layer": 2097152,
+      "memory_config": {
+        "alpha": 0.1,
+        "tau_new": 0.5,
+        "slot_capacity": 128,
+        "candidate_capacity": 8,
+        "locality_bits": 8,
+        "locality_probe_radius": 1,
+        "write_chunk_size": 64,
+        "index_mode": "mean_kv"
+      }
+    }
+  },
+  "output_dir": "outputs/cluster_router_validation_convomem4096_gpu_smoke5/state",
+  "run": {
+    "budgets": [4],
+    "fixed_policy": "recent",
+    "oracle_signal": "evidence",
+    "maximum_samples": 1,
+    "continue_on_error": false,
+    "resume": false
+  }
+}
