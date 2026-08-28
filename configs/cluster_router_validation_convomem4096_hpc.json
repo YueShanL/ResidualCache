@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
-  "run_id": "cluster_router_validation_convomem4096_256_gpu_v1",
+  "run_id": "cluster_router_validation_convomem4096_512_gpu_v1",
   "seed": 13,
   "paths": {
-    "output_root": "outputs/cluster_router_validation_convomem4096_256_gpu_v1",
+    "output_root": "outputs/cluster_router_validation_convomem4096_512_gpu_v1",
     "use_tmp_workspace": true,
     "tmp_workspace_root": "/tmp",
     "cleanup_tmp_workspace": true
@@ -31,14 +31,16 @@
   },
   "streaming": {
     "block_size": 64,
-    "local_context_length": 256,
+    "local_context_length": 512,
     "residual_layer": 40,
     "query_summary_length": 16,
-    "prefill_chunk_size": 64
+    "prefill_chunk_size": 64,
+    "ingestion_replay_policy": "none"
   },
   "memory": {
-    "memory_budget_bytes": 4194304,
+    "eviction_enabled": true,
     "slot_capacity": 128,
+    "initial_record_capacity": 4096,
     "candidate_capacity": 8,
     "locality_bits": 8,
     "locality_probe_radius": 1,
@@ -52,7 +54,11 @@
     "router_concentration_prior_mass": 1.0,
     "router_maximum_concentration": 1000.0,
     "index_mode": "mean_kv",
-    "locality_seed": 13
+    "locality_seed": 13,
+    "usage_ema_rate": 0.25,
+    "eviction_usage_threshold": 0.001,
+    "eviction_min_recall_count": 1,
+    "eviction_min_records_per_cluster": 1
   },
   "evaluation": {
     "budgets": [

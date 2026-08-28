@@ -42,7 +42,9 @@ _TOP_LEVEL_FIELDS = {
 }
 _MEMORY_FIELDS = {
     "memory_budget_bytes",
+    "eviction_enabled",
     "slot_capacity",
+    "initial_record_capacity",
     "candidate_capacity",
     "locality_bits",
     "locality_probe_radius",
@@ -57,6 +59,10 @@ _MEMORY_FIELDS = {
     "router_maximum_concentration",
     "index_mode",
     "locality_seed",
+    "usage_ema_rate",
+    "eviction_usage_threshold",
+    "eviction_min_recall_count",
+    "eviction_min_records_per_cluster",
 }
 
 
@@ -243,19 +249,35 @@ def validate_hpc_config(config: Mapping[str, Any]) -> None:
         )
     if int(streaming.get("residual_layer", 40)) < 0:
         raise ValueError("streaming.residual_layer cannot be negative")
+    if str(streaming.get("ingestion_replay_policy", "none")) not in {
+        "none",
+        "full_memory",
+    }:
+        raise ValueError(
+            "streaming.ingestion_replay_policy must be none or full_memory"
+        )
 
     memory = config["memory"]
     unknown_memory = set(memory).difference(_MEMORY_FIELDS)
     if unknown_memory:
         raise ValueError(f"unknown memory fields: {sorted(unknown_memory)}")
     for field in (
-        "memory_budget_bytes",
         "slot_capacity",
         "candidate_capacity",
         "locality_bits",
         "write_chunk_size",
     ):
         _require_positive_int(memory.get(field), f"memory.{field}")
+    if "memory_budget_bytes" in memory:
+        _require_positive_int(
+            memory["memory_budget_bytes"], "memory.memory_budget_bytes"
+        )
+    if "eviction_enabled" in memory:
+        _require_boolean(memory, "eviction_enabled", False)
+    if "initial_record_capacity" in memory:
+        _require_positive_int(
+            memory["initial_record_capacity"], "memory.initial_record_capacity"
+        )
     if int(memory["write_chunk_size"]) != block_size:
         raise ValueError("memory.write_chunk_size must equal streaming.block_size")
     if int(memory["slot_capacity"]) < int(memory["write_chunk_size"]):
@@ -481,6 +503,9 @@ class ClusterRouterHPCPipeline:
                     ),
                     "prefill_chunk_size": int(
                         streaming.get("prefill_chunk_size", streaming["block_size"])
+                    ),
+                    "ingestion_replay_policy": str(
+                        streaming.get("ingestion_replay_policy", "none")
                     ),
                     "memory_budget_bytes_per_layer": None,
                     "memory_config": dict(self.config["memory"]),

@@ -90,7 +90,9 @@ state file.
 See `configs/cluster_router_validation.example.json`. Factories use
 `package.module:callable` syntax and receive the configured keyword arguments.
 The concrete local 4096-token/256-example Gemma 4 run is fixed in
-`configs/cluster_router_validation_convomem4096_256.json`. Its ConvoMem rows
+`configs/cluster_router_validation_convomem4096_512.json`. It keeps Gemma 4's
+native 512-token sliding-attention span and grows to 576 tokens for each block
+transaction. Its ConvoMem rows
 are synthesized in process memory and are never written as an intermediate
 dataset.
 

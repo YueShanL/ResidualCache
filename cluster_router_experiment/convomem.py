@@ -26,7 +26,7 @@ class DynamicConvoMemDataset:
         maximum_future_horizon: int = 64,
         evidence_placement_bins: int = 4,
         block_size: int = 64,
-        local_context_length: int = 256,
+        local_context_length: int = 512,
     ) -> None:
         if sequence_count <= 0 or sequence_length <= 0:
             raise ValueError("sequence_count and sequence_length must be positive")

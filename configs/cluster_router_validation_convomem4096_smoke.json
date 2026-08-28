@@ -16,7 +16,7 @@
       "maximum_future_horizon": 64,
       "evidence_placement_bins": 4,
       "block_size": 64,
-      "local_context_length": 256
+      "local_context_length": 512
     }
   },
   "model": {
@@ -30,12 +30,17 @@
       "dtype": "bfloat16",
       "router_device": "cuda",
       "block_size": 64,
-      "local_context_length": 256,
+      "local_context_length": 512,
       "residual_layer": 40,
       "query_summary_length": 16,
       "prefill_chunk_size": 64,
-      "memory_budget_bytes_per_layer": 2097152,
+      "ingestion_replay_policy": "none",
       "memory_config": {
+        "eviction_enabled": true,
+        "usage_ema_rate": 0.25,
+        "eviction_usage_threshold": 0.001,
+        "eviction_min_recall_count": 1,
+        "eviction_min_records_per_cluster": 1,
         "alpha": 0.1,
         "tau_new": 0.5,
         "slot_capacity": 128,
@@ -47,7 +52,7 @@
       }
     }
   },
-  "output_dir": "outputs/cluster_router_validation_convomem4096_gpu_smoke5/state",
+  "output_dir": "outputs/cluster_router_validation_convomem4096_512_gpu_smoke/state",
   "run": {
     "budgets": [4],
     "fixed_policy": "recent",

@@ -300,6 +300,21 @@ def test_convomem_stratified_random_placement_is_neutral_and_retrievable():
         assert "Relevant earlier conversation" not in rendered
         assert "Intervening conversation" not in rendered
         assert rendered.count("Memory conversation:") >= 2
+        fact_ranges = row["memory_fact_token_ranges"]
+        assert len({item["fact_id"] for item in fact_ranges}) >= 2
+        assert sum(item["kind"] == "target" for item in fact_ranges) == 1
+        assert all(
+            row["distractor_token_range"][0]
+            <= item["start"]
+            < item["end"]
+            <= row["distractor_token_range"][1]
+            for item in fact_ranges
+        )
+        ordered = sorted(fact_ranges, key=lambda item: item["start"])
+        assert all(
+            left["end"] <= right["start"]
+            for left, right in zip(ordered, ordered[1:])
+        )
         record = SequenceRecord(row["sequence_id"], tuple(row["token_ids"]), row)
         plan = build_retrieval_plans(
             record,

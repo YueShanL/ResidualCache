@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import math
-from typing import Hashable, Iterable, Literal, Sequence
+from typing import Hashable, Iterable, Literal, Mapping, Sequence
 
 
 Vector = tuple[float, ...]
@@ -218,9 +218,15 @@ class MemoryConfig:
     weight_epsilon: float = 1e-6
     minimum_effective_weight: float = 1e-9
     new_record_protection: float = 0.0
+    # Compatibility switch only: a non-None legacy budget enables recall-local
+    # usage eviction but never imposes a global byte cap.
     memory_budget_bytes: int | None = None
+    eviction_enabled: bool | None = None
     memory_cost_lambda: float = 0.0
     budget_step_size: float = 1e-6
+    eviction_usage_threshold: float = 1e-4
+    eviction_min_recall_count: int = 1
+    eviction_min_records_per_cluster: int = 1
 
     route_top_k: int = 4
     child_top_k: int = 2
@@ -279,6 +285,12 @@ class MemoryConfig:
             raise ValueError("gain_exponent cannot be negative.")
         if self.memory_budget_bytes is not None and self.memory_budget_bytes <= 0:
             raise ValueError("memory_budget_bytes must be positive.")
+        if self.eviction_usage_threshold < 0.0:
+            raise ValueError("eviction_usage_threshold cannot be negative.")
+        if self.eviction_min_recall_count <= 0:
+            raise ValueError("eviction_min_recall_count must be positive.")
+        if self.eviction_min_records_per_cluster < 0:
+            raise ValueError("eviction_min_records_per_cluster cannot be negative.")
         if self.route_top_k <= 0 or self.child_top_k <= 0 or self.record_top_k <= 0:
             raise ValueError("Retrieval widths must be positive.")
         if self.minimum_child_mass <= 0.0:
@@ -287,6 +299,12 @@ class MemoryConfig:
             raise ValueError("split_patience must be positive.")
         if not 0.0 <= self.statistic_ema_rate <= 1.0:
             raise ValueError("statistic_ema_rate must be in [0, 1].")
+
+    @property
+    def usage_eviction_enabled(self) -> bool:
+        if self.eviction_enabled is not None:
+            return bool(self.eviction_enabled)
+        return self.memory_budget_bytes is not None
 
 
 @dataclass
@@ -1147,6 +1165,86 @@ class ProbabilisticHierarchicalMemory:
                 + ema_rate * float(attention_contribution)
             )
 
+    def observe_cluster_recall_usage(
+        self,
+        slot_id: str,
+        usage_by_record: Mapping[str, float],
+        *,
+        time: float | None = None,
+    ) -> MaintenanceReport:
+        """Update one fully recalled cluster and apply only cluster-local eviction.
+
+        Every active record in the leaf must be present.  Other leaves are not
+        inspected, so an un-recalled cluster can never be evicted by this call.
+        """
+
+        if slot_id not in self.leaves:
+            raise KeyError(slot_id)
+        slot = self.leaves[slot_id]
+        active_ids = tuple(
+            record_id for record_id in slot.record_ids if record_id in self.records
+        )
+        supplied = {str(record_id): float(value) for record_id, value in usage_by_record.items()}
+        if set(supplied) != set(active_ids):
+            missing = sorted(set(active_ids) - set(supplied))
+            extra = sorted(set(supplied) - set(active_ids))
+            raise ValueError(
+                "cluster recall usage must cover exactly the active leaf records; "
+                f"missing={missing}, extra={extra}"
+            )
+        if any(not math.isfinite(value) or value < 0.0 for value in supplied.values()):
+            raise ValueError("cluster recall usage must be finite and non-negative")
+        now = self._next_time(time)
+        rate = self.config.statistic_ema_rate
+        for record_id in active_ids:
+            record = self.records[record_id]
+            usage = supplied[record_id]
+            if record.retrieval_count == 0:
+                record.attention_contribution_ema = usage
+            else:
+                record.attention_contribution_ema = (
+                    (1.0 - rate) * record.attention_contribution_ema + rate * usage
+                )
+            record.retrieval_count += 1
+            record.last_retrieval_time = now
+        observed_mass = sum(supplied.values())
+        slot.usage_ema = (1.0 - rate) * slot.usage_ema + rate * observed_mass
+
+        evicted: list[str] = []
+        if self.config.usage_eviction_enabled:
+            eligible = [
+                self.records[record_id]
+                for record_id in active_ids
+                if self.records[record_id].retrieval_count
+                >= self.config.eviction_min_recall_count
+                and self.records[record_id].attention_contribution_ema
+                < self.config.eviction_usage_threshold
+                and now - self.records[record_id].write_time
+                >= self.config.new_record_protection
+            ]
+            eligible.sort(
+                key=lambda record: (
+                    record.attention_contribution_ema,
+                    record.sequence_order,
+                )
+            )
+            maximum = max(
+                0,
+                len(active_ids) - self.config.eviction_min_records_per_cluster,
+            )
+            for record in eligible[:maximum]:
+                evicted.append(record.id)
+                self._remove_record(record.id)
+        self._prune_empty_nodes()
+        self._refresh_all(now)
+        return MaintenanceReport(
+            evicted_record_ids=tuple(evicted),
+            split_slot_ids=(),
+            merged_slot_pairs=(),
+            memory_bytes=self.memory_bytes,
+            memory_cost_lambda=self._memory_cost_lambda,
+        )
+
     def _eviction_priority(self, record: MemoryRecord, time: float) -> float:
         inactivity = max(
             0.0,
@@ -1473,40 +1571,15 @@ class ProbabilisticHierarchicalMemory:
         return True
 
     def maintain(self, *, time: float | None = None) -> MaintenanceReport:
-        """Apply exact expiry, budget control, split, and merge maintenance."""
+        """Refresh topology without applying any global record eviction.
+
+        Record eviction is intentionally confined to
+        :meth:`observe_cluster_recall_usage`, after a complete cluster recall.
+        """
 
         now = self._next_time(time)
         self._refresh_all(now)
         evicted: list[str] = []
-        for record in list(self.records.values()):
-            age = now - record.write_time
-            if (
-                age >= self.config.new_record_protection
-                and self._record_weight(record, now) < self.config.minimum_effective_weight
-            ):
-                evicted.append(record.id)
-                self._remove_record(record.id)
-
-        budget = self.config.memory_budget_bytes
-        if budget is not None:
-            self._memory_cost_lambda = max(
-                0.0,
-                self._memory_cost_lambda
-                + self.config.budget_step_size * (self.memory_bytes - budget),
-            )
-            eligible = [
-                record
-                for record in self.records.values()
-                if now - record.write_time >= self.config.new_record_protection
-            ]
-            eligible.sort(key=lambda record: self._eviction_priority(record, now))
-            for record in eligible:
-                expected_gain = self._eviction_priority(record, now) * record.approximate_bytes()
-                storage_cost = self._memory_cost_lambda * record.approximate_bytes()
-                if self.memory_bytes <= budget and expected_gain > storage_cost:
-                    break
-                evicted.append(record.id)
-                self._remove_record(record.id)
 
         self._prune_empty_nodes()
         self._refresh_all(now)

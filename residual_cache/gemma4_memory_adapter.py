@@ -338,12 +338,20 @@ class Gemma4StaticKVController:
     behavior.
     """
 
-    def __init__(self, layer_kv: dict[int, tuple[Any, Any]]):
+    def __init__(
+        self,
+        layer_kv: dict[int, tuple[Any, Any]],
+        *,
+        collect_historical_usage: bool = False,
+    ):
         self.layer_kv = {int(layer): pair for layer, pair in layer_kv.items()}
         if any(layer < 0 for layer in self.layer_kv):
             raise ValueError("static K/V layer indices must be non-negative")
         self.layer_calls: dict[int, int] = {}
         self.retrieved_tokens_by_layer: dict[int, int] = {}
+        self.collect_historical_usage = bool(collect_historical_usage)
+        self._historical_usage_sums: dict[int, Any] = {}
+        self._historical_usage_denominators: dict[int, int] = {}
 
     @staticmethod
     def physical_source_layer(module) -> int:
@@ -428,7 +436,31 @@ class Gemma4StaticKVController:
             self.retrieved_tokens_by_layer.get(source_layer, 0)
             + int(historical_key.shape[0] * historical_key.shape[2])
         )
+        if self.collect_historical_usage:
+            weights = output[1][..., : historical_key.shape[2]].detach().float()
+            usage_sum = weights.sum(dim=(0, 1, 2))
+            denominator = int(weights.shape[0] * weights.shape[1] * weights.shape[2])
+            previous = self._historical_usage_sums.get(source_layer)
+            if previous is None:
+                self._historical_usage_sums[source_layer] = usage_sum
+            else:
+                if previous.shape != usage_sum.shape:
+                    raise ValueError(
+                        "historical K/V length changed while collecting recall usage"
+                    )
+                previous.add_(usage_sum)
+            self._historical_usage_denominators[source_layer] = (
+                self._historical_usage_denominators.get(source_layer, 0) + denominator
+            )
         return output
+
+    def historical_usage_rates(self) -> dict[int, Any]:
+        """Return mean attention probability aligned with each historical K/V row."""
+
+        return {
+            layer: values / self._historical_usage_denominators[layer]
+            for layer, values in self._historical_usage_sums.items()
+        }
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -440,6 +472,12 @@ class Gemma4StaticKVController:
                 str(layer): int(key.shape[0] * key.shape[2])
                 for layer, (key, _value) in sorted(self.layer_kv.items())
             },
+            "historical_usage_collected": self.collect_historical_usage,
+            "historical_usage_metric": (
+                "mean_attention_probability_per_historical_record"
+                if self.collect_historical_usage
+                else None
+            ),
         }
 
 
@@ -514,9 +552,18 @@ class Gemma4MemoryAdapter:
 class Gemma4StaticKVAdapter:
     """Temporarily inject externally selected historical K/V into Gemma 4."""
 
-    def __init__(self, model, layer_kv: dict[int, tuple[Any, Any]]):
+    def __init__(
+        self,
+        model,
+        layer_kv: dict[int, tuple[Any, Any]],
+        *,
+        collect_historical_usage: bool = False,
+    ):
         self.model = model
-        self.controller = Gemma4StaticKVController(layer_kv)
+        self.controller = Gemma4StaticKVController(
+            layer_kv,
+            collect_historical_usage=collect_historical_usage,
+        )
         self.modules = [
             module
             for module in _gemma4_text_attention_modules(model)

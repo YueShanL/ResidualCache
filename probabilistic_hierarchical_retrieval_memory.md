@@ -11,7 +11,7 @@
 - 对碎片化簇的 merge；
 - 分层 ANN 路由、簇内精确 K/V 重排和原生 attention。
 
-目标不是声称聚类后的表示与完整历史 attention 严格等价，而是在受控内存和计算预算下，尽可能保留可被未来查询重新访问的历史信息。
+目标不是声称聚类后的表示与完整历史 attention 严格等价，而是在簇内 usage 驱动的压缩和受控计算量下，尽可能保留可被未来查询重新访问的历史信息。
 
 ## 2. 核心研究问题
 
@@ -107,7 +107,7 @@ record:
   source_authority
 ```
 
-`source_token_or_span` 用于需要时重建更完整的历史 K/V。若存储预算允许，优先保存量化后的原始 K/V，避免重复执行历史 forward。
+`source_token_or_span` 用于需要时重建更完整的历史 K/V。实现优先保存量化后的原始 K/V，避免重复执行历史 forward。
 
 ### 5.2 Leaf Slot
 
@@ -236,7 +236,7 @@ P(z=i)\propto(N_i^{eff}+\epsilon)^\gamma,
 - 剔除低价值记录；
 - 对宽簇降低 likelihood concentration；
 - 对高 conflict 或高 routing regret 簇执行 split；
-- 对持续增长但不能提高召回的簇设置容量惩罚。
+- 对 recall 后长期低使用率的 record 仅在所属簇内执行 eviction。
 
 ## 8. 时间、模型行为与记录保留
 
@@ -286,27 +286,21 @@ attention weight 不能单独作为价值，因为它不直接等于对最终输
 
 ### 8.3 保留决策
 
-记录应在其预期未来收益低于存储成本时过期：
+Memory 不设置全局字节或簇数量硬上限。预算字段只负责开启 eviction
+模式，不能触发跨簇排序或把总空间截断到某个目标值。
+
+只有一个簇被完整 recall 并完成 attention 后，才更新该簇内 record 的使用率
+EMA。未 recall 的簇不更新，也不能被本次 eviction 影响。对已 recall 的簇，
+仅移除使用率低于阈值且已经满足最小观测次数的 record：
 
 \[
-P(\mathrm{reuse}\mid H_t)
-E[\mathrm{gain}\mid r_j]
-\leq
-\lambda_{\mathrm{mem}}\operatorname{bytes}(r_j)
+u_{j,t}=(1-\rho)u_{j,t-1}+\rho\,\bar a_{j,t},\qquad
+\operatorname{evict}(r_j)\iff u_{j,t}<\tau_u
 \]
 
-预算控制器动态调整 \(\lambda_{\mathrm{mem}}\)：
-
-\[
-\lambda_{\mathrm{mem},t+1}
-=
-\left[
-\lambda_{\mathrm{mem},t}
-+\eta(\operatorname{Memory}_t-B)
-\right]_+
-\]
-
-这样 threshold 与模型行为、记录顺序和实际预算共同变化，而不是固定 TTL。
+其中 \(\bar a_{j,t}\) 是该次 recall 后，跨相关 layer、head 和 query token
+平均的 attention probability。可配置的簇内最小保留数只是结构安全条件，
+不是全局容量预算。
 
 ### 8.4 可删除性约束
 
@@ -600,16 +594,14 @@ s_i'=s_i+\log n_i
 ### 13.3 周期维护
 
 ```text
-1. decay record weights
-2. evict records below expected-utility threshold
-3. rebuild affected sufficient statistics
-4. evaluate pending splits
-5. evaluate neighboring merges
-6. compact posting lists and ANN index
-7. recalibrate per-layer density parameters
+1. refresh temporal weights without deleting records
+2. evaluate pending splits
+3. evaluate neighboring merges
+4. compact posting lists and ANN index
+5. recalibrate per-layer density parameters
 ```
 
-维护应异步或分批执行，避免每个 token 都承担全量管理成本。
+record eviction 不属于全局周期维护；它紧跟完整 cluster recall，在该簇内局部执行。
 
 ## 14. 与 CAMELoT 的公平对比
 
@@ -620,7 +612,7 @@ s_i'=s_i+\log n_i
 - K/V 提取方式；
 - read top-k；
 - 当前窗口长度；
-- memory byte budget；
+- 是否开启相同的簇内 usage eviction；
 - 最终 attention 注入方式；
 - 数据顺序和评估任务。
 

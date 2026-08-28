@@ -172,9 +172,9 @@ def _neutral_distractor_tokens(
     tokenizer: Any,
     required_tokens: int,
     rng: random.Random,
-) -> tuple[list[int], list[str]]:
+) -> tuple[list[int], list[str], list[tuple[str, int, int]]]:
     if required_tokens <= 0:
-        return [], []
+        return [], [], []
     eligible = [
         candidate
         for candidate in candidates
@@ -186,6 +186,7 @@ def _neutral_distractor_tokens(
     rng.shuffle(eligible)
     tokens: list[int] = []
     identifiers: list[str] = []
+    fact_ranges: list[tuple[str, int, int]] = []
     cursor = 0
     while len(tokens) < required_tokens:
         candidate = eligible[cursor % len(eligible)]
@@ -196,9 +197,11 @@ def _neutral_distractor_tokens(
         if not piece:
             continue
         take = min(required_tokens - len(tokens), len(piece))
+        start = len(tokens)
         tokens.extend(piece[:take])
         identifiers.append(candidate.example_id)
-    return tokens, identifiers
+        fact_ranges.append((candidate.example_id, start, start + take))
+    return tokens, identifiers, fact_ranges
 
 
 def _stratified_target_start(
@@ -341,11 +344,15 @@ def build_convomem_long_sequences(
             suffix_count = memory_token_count - prefix_count - len(target_ids)
             if suffix_count < 0:
                 continue
-            distractor_prefix, prefix_examples = _neutral_distractor_tokens(
-                target, selected_pool, tokenizer, prefix_count, rng
+            distractor_prefix, prefix_examples, prefix_fact_ranges = (
+                _neutral_distractor_tokens(
+                    target, selected_pool, tokenizer, prefix_count, rng
+                )
             )
-            distractor_suffix, suffix_examples = _neutral_distractor_tokens(
-                target, selected_pool, tokenizer, suffix_count, rng
+            distractor_suffix, suffix_examples, suffix_fact_ranges = (
+                _neutral_distractor_tokens(
+                    target, selected_pool, tokenizer, suffix_count, rng
+                )
             )
             memory_ids = distractor_prefix + target_ids + distractor_suffix
             if len(memory_ids) != memory_token_count:
@@ -360,6 +367,32 @@ def build_convomem_long_sequences(
                 [question_start, target_start],
                 [target_start + len(target_ids), question_start + memory_token_count],
             ]
+            memory_fact_token_ranges = [
+                {
+                    "fact_id": fact_id,
+                    "kind": "distractor",
+                    "start": question_start + start,
+                    "end": question_start + end,
+                }
+                for fact_id, start, end in prefix_fact_ranges
+            ]
+            memory_fact_token_ranges.append(
+                {
+                    "fact_id": target.example_id,
+                    "kind": "target",
+                    "start": target_start,
+                    "end": target_start + len(target_ids),
+                }
+            )
+            memory_fact_token_ranges.extend(
+                {
+                    "fact_id": fact_id,
+                    "kind": "distractor",
+                    "start": target_start + len(target_ids) + start,
+                    "end": target_start + len(target_ids) + end,
+                }
+                for fact_id, start, end in suffix_fact_ranges
+            )
             distractor_range = [question_start, question_start + memory_token_count]
             question_start += memory_token_count
             question_end += memory_token_count
@@ -399,6 +432,11 @@ def build_convomem_long_sequences(
                 "evidence_placement_bin": placement_bin,
                 "placement_candidate_count": placement_candidate_count,
                 "target_memory_chunk_range": target_chunk_range,
+                "memory_fact_token_ranges": (
+                    memory_fact_token_ranges
+                    if evidence_placement == "stratified_random"
+                    else []
+                ),
                 "evidence_block_indices": list(
                     range(
                         evidence_start // placement_block_size,

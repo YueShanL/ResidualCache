@@ -17,6 +17,11 @@ target fact better than chance.
 - `learnable_index/`: standalone learned block-attention index contracts,
   router, trainer, metrics, and offline smoke CLI. It does not import the
   existing `residual_cache` package.
+- `block_probability_router/`: independent positive two-tower successor that
+  reuses only the aligned collection contract. It learns normalized
+  next-block memory probabilities with an explicit `q dot sum(keys)`
+  denominator and supports probability-threshold retrieval without changing
+  the legacy router.
 - `cluster_router_bridge/`: independent integration which splits blocks,
   transports learned keys into memory-owned record metadata, invokes the
   memory-owned per-leaf router-vMF index, and packs selected clusters into
@@ -29,15 +34,41 @@ target fact better than chance.
   separate from metric iteration. Its config-driven HPC wrapper can keep all
   collection state in node-local temporary storage and persist only metrics.
 - `cluster_router_experiment/`: concrete Gemma 4/ConvoMem composition. It runs a
-  256-token retained cache that grows to 320 while one new 64-token block is
+  512-token retained cache that grows to 576 while one new 64-token block is
   evaluated. It prepares the learned block key, unloads the oldest block, and
   writes that block as one pre-commit transaction.
-- `residual_cache/gpu_local_cluster_memory.py`: fixed-budget GPU K/V records and
-  GPU vMF sufficient statistics. During ingestion, CPU locality lookup returns
+- `residual_cache/gpu_local_cluster_memory.py`: dynamically growing GPU K/V
+  records and GPU vMF sufficient statistics. Cluster and record tensor storage
+  grows on demand; no global byte or cluster-count cap evicts data. During
+  ingestion, CPU locality lookup returns
   at most `candidate_capacity` slot IDs; exact posterior assignment and every
   numerical update are executed only on those GPU slots. Every record has its
   own posterior, but records from one unloaded block share the same pre-commit
   state and commit together. No ingestion path scans every active cluster.
+  Eviction is optional and occurs only after a complete cluster recall, using
+  per-record attention-usage EMA within that same cluster.
+- `residual_cache/gpu_block_cluster_memory.py`: independent block-record memory.
+  Each layer-local block is one indivisible record; its learned router block key
+  directly drives locality lookup, posterior cluster assignment, and query-time
+  cluster scoring, while the original complete-block K/V is replay payload
+  only. It shares the vMF classifier functions with the token memory but has
+  separate storage, packing, usage, eviction, config, and public entry points.
+- `memory_replay_calibration/`: focused full-context vs full-memory-replay
+  calibration. It collects post-recall record usage once and sweeps cluster-local
+  eviction thresholds without router Top-N selection or repeated ingestion.
+- `memory_cluster_calibration/`: static clustering-parameter sweep over one fixed
+  GPU K/V capture per sample. Every candidate starts from an empty memory and sees
+  identical records in identical order; fact labels remain offline-only. The
+  report rejects singleton/oversized allocation degeneracies and emits
+  `possible_structural_limit` when repeated sample/layer conditions cannot beat a
+  deterministic fact-label permutation baseline.
+- `block_memory_cluster_calibration/`: independent static sweep for
+  `GpuBlockClusterMemory`. It uses a block-aligned dynamic 512--575 local cache,
+  admits only complete 64-token records, reuses one fixed router-key/KV capture
+  across every variant, and measures block-level fact separation plus Top-N
+  target recall and selected-block ratio. Because K/V is not a classification
+  feature, one representative full-attention payload layer exactly represents
+  the shared assignment produced for all physical memory layers.
 - `learned_block_attention_index.md`: development specification for the
   learned prompt-free block-attention index over historical KV-cache records.
 

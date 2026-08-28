@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from contextlib import nullcontext
 from pathlib import Path
 import time
 from typing import Any, Mapping, Sequence
@@ -106,12 +107,13 @@ class Gemma4ClusterRouterModel:
         dtype: str = "bfloat16",
         router_device: str | None = None,
         block_size: int = 64,
-        local_context_length: int = 256,
+        local_context_length: int = 512,
         residual_layer: int = 40,
         query_summary_length: int = 16,
         prefill_chunk_size: int = 64,
-        memory_budget_bytes_per_layer: int | None = 16 * 1024 * 1024,
+        memory_budget_bytes_per_layer: int | None = None,
         memory_config: Mapping[str, Any] | None = None,
+        ingestion_replay_policy: str = "none",
     ) -> None:
         self.checkpoint_path = Path(checkpoint_path)
         if not self.checkpoint_path.is_file():
@@ -121,6 +123,9 @@ class Gemma4ClusterRouterModel:
         self.residual_layer = int(residual_layer)
         self.query_summary_length = int(query_summary_length)
         self.prefill_chunk_size = int(prefill_chunk_size)
+        self.ingestion_replay_policy = str(ingestion_replay_policy)
+        if self.ingestion_replay_policy not in {"none", "full_memory"}:
+            raise ValueError("ingestion_replay_policy must be 'none' or 'full_memory'")
         if min(
             self.block_size,
             self.local_context_length,
@@ -139,7 +144,8 @@ class Gemma4ClusterRouterModel:
             )
             if int(configured) != int(memory_budget_bytes_per_layer):
                 raise ValueError(
-                    "memory budget conflicts with memory_config.memory_budget_bytes"
+                    "legacy eviction switch conflicts with "
+                    "memory_config.memory_budget_bytes"
                 )
         self.memory_config = GpuLocalClusterMemoryConfig(**memory_values)
         self.bundle = load_frozen_gemma(
@@ -176,9 +182,12 @@ class Gemma4ClusterRouterModel:
             "memory_layers": list(self.memory_layers),
             "memory_config": asdict(self.memory_config),
             "ingestion_backend": "gpu_local_vmf",
+            "ingestion_replay_policy": self.ingestion_replay_policy,
             "ingestion_protocol": (
-                "single-pass 256-to-320 block context; block keys are prepared at "
-                "completion; the oldest 64-token block is unloaded, posterior-scored "
+                f"single-pass {self.local_context_length}-to-"
+                f"{self.local_context_length + self.block_size} block context; "
+                "block keys are prepared at completion; the oldest "
+                f"{self.block_size}-token block is unloaded, posterior-scored "
                 "against one pre-commit state, and committed simultaneously; CPU "
                 "prefetches bounded cluster IDs only"
             ),
@@ -298,6 +307,18 @@ class _Gemma4ClusterRouterSession:
                     flush=True,
                 )
 
+        def ingestion_forward_context():
+            if owner.ingestion_replay_policy != "full_memory" or not self.memories:
+                return nullcontext()
+            layer_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+            for layer, memory in self.memories.items():
+                key, value, _positions, _record_ids = memory.all_kv_records()
+                if key.shape[2] > 0:
+                    layer_kv[layer] = (key, value)
+            if not layer_kv:
+                return nullcontext()
+            return Gemma4StaticKVAdapter(owner.bundle.model, layer_kv)
+
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         start = time.perf_counter()
@@ -307,6 +328,7 @@ class _Gemma4ClusterRouterSession:
             on_block_ready=prepare_block_key,
             on_evict=ingest_evicted,
             progress=report_progress,
+            forward_context=ingestion_forward_context,
         )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -466,9 +488,12 @@ class _Gemma4ClusterRouterSession:
             state=dict(state),
         )
 
-    def _restricted_logits(
-        self, layer_kv: Mapping[int, tuple[torch.Tensor, torch.Tensor]]
-    ) -> torch.Tensor:
+    def _restricted_logits_and_usage(
+        self,
+        layer_kv: Mapping[int, tuple[torch.Tensor, torch.Tensor]],
+        *,
+        collect_historical_usage: bool = False,
+    ) -> tuple[torch.Tensor, dict[int, torch.Tensor], Mapping[str, Any]]:
         start = self.plan.future_start
         end = self.plan.future_end
         query_positions = tuple(range(start, end))
@@ -488,12 +513,80 @@ class _Gemma4ClusterRouterSession:
             use_cache=True,
             logical_cache_position=True,
         )
+        controller = None
         if layer_kv:
-            with Gemma4StaticKVAdapter(self.owner.bundle.model, dict(layer_kv)):
+            with Gemma4StaticKVAdapter(
+                self.owner.bundle.model,
+                dict(layer_kv),
+                collect_historical_usage=collect_historical_usage,
+            ) as controller:
                 output = operation()
         else:
             output = operation()
-        return output.logits[0].detach().float().cpu()
+        usage = (
+            {
+                int(layer): values.detach()
+                for layer, values in controller.historical_usage_rates().items()
+            }
+            if controller is not None and collect_historical_usage
+            else {}
+        )
+        state = controller.snapshot() if controller is not None else {}
+        return output.logits[0].detach().float().cpu(), usage, state
+
+    def _restricted_logits(
+        self, layer_kv: Mapping[int, tuple[torch.Tensor, torch.Tensor]]
+    ) -> torch.Tensor:
+        logits, _usage, _state = self._restricted_logits_and_usage(layer_kv)
+        return logits
+
+    def packed_full_memory(self):
+        """Return every retained historical record, bypassing router selection."""
+
+        layer_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        record_ids: dict[int, tuple[str, ...]] = {}
+        positions: dict[int, tuple[int, ...]] = {}
+        for layer, memory in sorted(self.memories.items()):
+            key, value, logical_positions, external_ids = memory.all_kv_records()
+            if key.shape[2] > 0:
+                layer_kv[layer] = (key, value)
+                record_ids[layer] = external_ids
+                positions[layer] = logical_positions
+        return layer_kv, record_ids, positions
+
+    def packed_record_plan(
+        self, retained_record_ids: Mapping[int, Sequence[str]]
+    ) -> tuple[
+        dict[int, tuple[torch.Tensor, torch.Tensor]],
+        dict[int, tuple[str, ...]],
+        dict[int, tuple[int, ...]],
+    ]:
+        layer_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        aligned_ids: dict[int, tuple[str, ...]] = {}
+        positions: dict[int, tuple[int, ...]] = {}
+        for layer, ids in sorted(retained_record_ids.items()):
+            key, value, logical_positions, external_ids = self.memories[int(layer)].kv_for_record_ids(ids)
+            if key.shape[2] > 0:
+                layer_kv[int(layer)] = (key, value)
+                aligned_ids[int(layer)] = external_ids
+                positions[int(layer)] = logical_positions
+        return layer_kv, aligned_ids, positions
+
+    def collect_full_replay_usage(self):
+        """Replay all memory and collect per-record post-recall attention use."""
+
+        layer_kv, record_ids, positions = self.packed_full_memory()
+        logits, usage, adapter_state = self._restricted_logits_and_usage(
+            layer_kv,
+            collect_historical_usage=True,
+        )
+        for layer, ids in record_ids.items():
+            rates = usage.get(layer)
+            if rates is None or rates.numel() != len(ids):
+                raise RuntimeError(
+                    f"missing or misaligned recall usage for physical layer {layer}"
+                )
+        return logits, record_ids, positions, usage, adapter_state
 
     def run_full_context(self) -> ModelRun:
         print(f"[{self.example.sample_id}] condition full_context", flush=True)
@@ -592,7 +685,10 @@ class _Gemma4ClusterRouterSession:
                 latency=latency,
                 peaks=peaks,
             ),
-            state={"baseline": "local_256_only", "teacher_forced": True},
+            state={
+                "baseline": f"local_{self.owner.local_context_length}_only",
+                "teacher_forced": True,
+            },
         )
 
     def run_with_clusters(

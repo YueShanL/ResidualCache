@@ -357,7 +357,7 @@ class TemporalAndRetrievalTests(unittest.TestCase):
 
         self.assertEqual(result[0].source_token_or_span, "authoritative")
 
-    def test_decay_can_evict_an_individual_record_and_rebuild_statistics(self):
+    def test_maintenance_never_globally_evicts_decayed_records(self):
         memory = TemporalVMFMemory(
             self._one_slot_config(
                 age_decay=1.0,
@@ -368,22 +368,28 @@ class TemporalAndRetrievalTests(unittest.TestCase):
 
         report = memory.maintain(time=4.0)
 
-        self.assertEqual(len(report.evicted_record_ids), 1)
-        self.assertEqual(memory.record_count, 0)
-        self.assertEqual(memory.slot_count, 0)
+        self.assertEqual(report.evicted_record_ids, ())
+        self.assertEqual(memory.record_count, 1)
+        self.assertEqual(memory.slot_count, 1)
 
-    def test_budget_controller_respects_new_record_protection(self):
+    def test_legacy_budget_only_enables_recall_local_usage_eviction(self):
         memory = TemporalVMFMemory(
             self._one_slot_config(
                 memory_budget_bytes=1,
                 budget_step_size=0.01,
                 new_record_protection=5.0,
+                eviction_usage_threshold=0.1,
+                eviction_min_records_per_cluster=0,
             )
         )
-        memory.write((1.0, 0.0), (1.0, 0.0), (1.0,), time=1.0)
+        decision = memory.write((1.0, 0.0), (1.0, 0.0), (1.0,), time=1.0)
 
-        protected = memory.maintain(time=2.0)
-        expired = memory.maintain(time=7.0)
+        protected = memory.observe_cluster_recall_usage(
+            decision.slot_id, {decision.record_id: 0.0}, time=2.0
+        )
+        expired = memory.observe_cluster_recall_usage(
+            decision.slot_id, {decision.record_id: 0.0}, time=7.0
+        )
 
         self.assertEqual(protected.evicted_record_ids, ())
         self.assertEqual(len(expired.evicted_record_ids), 1)

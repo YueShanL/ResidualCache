@@ -776,6 +776,41 @@ both evidence retention/coverage and the exact retained-record count. A larger
 budget is a separate retention sensitivity run, not a hidden change to router
 quality.
 
+### Positive block-probability router successor
+
+The next router experiment lives in the independent
+`block_probability_router` package. It reuses the aligned frozen-model data
+contract and the existing Gemma collector's explicit logical positions,
+restricted cache construction, layer-40 query/key summaries, and teacher
+layers 29/35/41. It does not add an architecture flag or checkpoint fallback
+to `learnable_index`.
+
+For a retrieval point `t`, `M_t` contains only completed historical memory
+blocks. The visible live history produces `q_t` but is not inserted as a key,
+and the supervision is the mean teacher attention of the following block,
+conditioned only on `M_t`. With positive feature towers, the router computes:
+
+```text
+w_b = phi_q(q_t)^T phi_k(k_b)
+S_M = sum_{b in M_t} phi_k(k_b)
+Z_M = phi_q(q_t)^T S_M = sum_b w_b
+p_hat(b | M_t) = w_b / Z_M
+```
+
+There is no learned demand head, student softmax, or local-history term in the
+normalizer. At inference, `p_hat(b | M_t) > tau` is exactly equivalent to the
+weight-space range condition `w_b > tau * Z_M`; the denominator is therefore
+retained even when candidate retrieval is implemented with a MIPS index.
+
+The end-to-end runner is
+`scripts/run_block_probability_router_hpc.py`, with the controlled 4096-document
+ConvoMem experiment in
+`configs/block_probability_router_convomem4096_hpc.json`. The new target uses a
+64-token maximum future horizon to match the 64-token memory block. Temporary
+mode exports the best model, training curve/summary, and official
+validation/test metrics while discarding synthesized rows, aligned collection,
+model cache, and transient state.
+
 ## Decision Log
 
 The following decisions are fixed for the first implementation:

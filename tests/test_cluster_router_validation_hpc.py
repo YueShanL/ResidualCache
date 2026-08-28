@@ -46,14 +46,16 @@ def _config(tmp_path: Path) -> dict:
         },
         "streaming": {
             "block_size": 64,
-            "local_context_length": 256,
+            "local_context_length": 512,
             "residual_layer": 40,
             "query_summary_length": 16,
             "prefill_chunk_size": 64,
+            "ingestion_replay_policy": "full_memory",
         },
         "memory": {
-            "memory_budget_bytes": 4 * 1024 * 1024,
+            "eviction_enabled": True,
             "slot_capacity": 128,
+            "initial_record_capacity": 4096,
             "candidate_capacity": 8,
             "locality_bits": 8,
             "locality_probe_radius": 1,
@@ -61,6 +63,10 @@ def _config(tmp_path: Path) -> dict:
             "alpha": 0.1,
             "tau_new": 0.5,
             "index_mode": "mean_kv",
+            "usage_ema_rate": 0.25,
+            "eviction_usage_threshold": 0.001,
+            "eviction_min_recall_count": 1,
+            "eviction_min_records_per_cluster": 1,
         },
         "evaluation": {
             "budgets": [4],
@@ -110,6 +116,9 @@ def test_generated_collect_config_uses_hf_ids_router_and_tmp_cache(
     assert dataset["sequence_length"] == 4096
     assert model["model_name"] == "google/gemma-4-E4B-it"
     assert model["checkpoint_path"] == str((tmp_path / "router.pt").resolve())
+    assert dataset["local_context_length"] == 512
+    assert model["local_context_length"] == 512
+    assert model["ingestion_replay_policy"] == "full_memory"
     assert model["memory_config"]["write_chunk_size"] == 64
     assert generated["output_dir"] == str(pipeline.state_dir)
 

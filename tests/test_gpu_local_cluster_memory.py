@@ -11,7 +11,7 @@ def _block(vectors):
     return tensor, tensor.roll(1, dims=-1)
 
 
-def test_gpu_local_ingestion_is_bounded_and_router_is_metadata_only():
+def test_gpu_local_ingestion_grows_and_router_is_metadata_only():
     from residual_cache.gpu_local_cluster_memory import (
         GpuLocalClusterMemory,
         GpuLocalClusterMemoryConfig,
@@ -26,6 +26,7 @@ def test_gpu_local_ingestion_is_bounded_and_router_is_metadata_only():
         config=GpuLocalClusterMemoryConfig(
             memory_budget_bytes=256_000,
             slot_capacity=8,
+            initial_record_capacity=2,
             candidate_capacity=2,
             locality_bits=4,
             write_chunk_size=1,
@@ -77,10 +78,13 @@ def test_gpu_local_ingestion_is_bounded_and_router_is_metadata_only():
     assert snapshot["global_assignment_scans"] == 0
     assert snapshot["maximum_candidate_slots_considered"] <= 2
     assert snapshot["cpu_prefetch_payload"] == "bounded_cluster_ids_only"
-    assert snapshot["memory_bytes"] <= snapshot["memory_budget_bytes"]
+    assert snapshot["record_capacity_policy"] == "dynamic_unbounded"
+    assert snapshot["usage_eviction_enabled"] is True
+    assert snapshot["memory_budget_role"] == "legacy_eviction_enable_switch_only"
+    assert snapshot["allocated_record_capacity"] >= 4
 
 
-def test_gpu_local_record_ring_evicts_without_global_priority_scan():
+def test_gpu_local_records_grow_without_global_eviction():
     from residual_cache.gpu_local_cluster_memory import (
         GpuLocalClusterMemory,
         GpuLocalClusterMemoryConfig,
@@ -95,15 +99,15 @@ def test_gpu_local_record_ring_evicts_without_global_priority_scan():
         config=GpuLocalClusterMemoryConfig(
             memory_budget_bytes=4_500,
             slot_capacity=4,
+            initial_record_capacity=2,
             candidate_capacity=2,
             locality_bits=4,
             write_chunk_size=1,
             tau_new=1.0,
         ),
     )
-    capacity = memory.record_capacity
-    assert capacity >= 2
-    count = capacity + 2
+    initial_capacity = memory.record_capacity
+    count = initial_capacity + 4
     vectors = [[1.0] + [0.0] * 31 for _ in range(count)]
     keys, values = _block(vectors)
     router = torch.tensor([1.0] + [0.0] * 31)
@@ -118,9 +122,80 @@ def test_gpu_local_record_ring_evicts_without_global_priority_scan():
             router_block_size=end - start,
         )
 
-    assert memory.active_record_count == capacity
-    assert memory.evicted_records == count - capacity
+    assert memory.active_record_count == count
+    assert memory.record_capacity >= count
+    assert memory.evicted_records == 0
+    assert memory.memory_bytes > 4_500
     assert memory.snapshot()["global_assignment_scans"] == 0
+
+
+def test_usage_eviction_is_confined_to_complete_recalled_clusters(monkeypatch):
+    from residual_cache.gpu_local_cluster_memory import (
+        GpuLocalClusterMemory,
+        GpuLocalClusterMemoryConfig,
+    )
+
+    memory = GpuLocalClusterMemory(
+        kv_heads=1,
+        head_dim=32,
+        router_dim=32,
+        device="cpu",
+        dtype=torch.float32,
+        config=GpuLocalClusterMemoryConfig(
+            eviction_enabled=True,
+            eviction_usage_threshold=0.05,
+            eviction_min_records_per_cluster=1,
+            slot_capacity=1,
+            initial_record_capacity=2,
+            candidate_capacity=1,
+            locality_bits=2,
+            write_chunk_size=1,
+            tau_new=1.0,
+        ),
+    )
+    router = torch.tensor([1.0] + [0.0] * 31)
+    first, first_values = _block([[1.0] + [0.0] * 31 for _ in range(4)])
+    for index in range(4):
+        memory.ingest_block(
+            first[:, :, index : index + 1],
+            first_values[:, :, index : index + 1],
+            router_key=router,
+            block_id="recalled",
+            logical_positions=(index,),
+        )
+    original_posterior = memory._posterior
+
+    def force_new(directions, candidate_ids, candidate_valid):
+        selected, _create_new = original_posterior(
+            directions, candidate_ids, candidate_valid
+        )
+        return selected, torch.ones_like(selected, dtype=torch.bool)
+
+    monkeypatch.setattr(memory, "_posterior", force_new)
+    second, second_values = _block([[0.0, 1.0] + [0.0] * 30])
+    memory.ingest_block(
+        second,
+        second_values,
+        router_key=router,
+        block_id="untouched",
+        logical_positions=(4,),
+    )
+    clusters = memory.router_clusters(router)
+    recalled = next(cluster for cluster in clusters if len(cluster.record_ids) == 4)
+    untouched = next(cluster for cluster in clusters if len(cluster.record_ids) == 1)
+
+    with pytest.raises(ValueError, match="cover every active record"):
+        memory.observe_recall_usage(recalled.record_ids[:1], [1.0])
+
+    result = memory.observe_recall_usage(
+        recalled.record_ids,
+        [0.5, 0.01, 0.001, 0.0],
+    )
+    assert result["evicted_records"] == 3
+    assert memory.active_record_count == 2
+    remaining = memory.router_clusters(router)
+    assert any(cluster.record_ids == untouched.record_ids for cluster in remaining)
+    assert memory.snapshot()["eviction_scope"] == "recalled_cluster_only"
 
 
 def test_gpu_block_transaction_scores_one_batch_against_precommit_state(monkeypatch):

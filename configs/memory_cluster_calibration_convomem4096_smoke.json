@@ -1,0 +1,72 @@
+{
+  "output_dir": "outputs/memory_cluster_calibration_convomem4096_smoke",
+  "seed": 13,
+  "data": {
+    "dataset_name": "Salesforce/ConvoMem",
+    "tokenizer_name": "google/gemma-4-E4B-it",
+    "dataset_cache_dir": "E:/huggingface/hub",
+    "tokenizer_cache_dir": "outputs/hf_cache/hub",
+    "local_files_only": true,
+    "split": "test",
+    "sequence_count": 1,
+    "sequence_length": 4096,
+    "seed": 13,
+    "sampling_seed": 97,
+    "maximum_answer_tokens": 64,
+    "maximum_future_horizon": 64,
+    "evidence_placement_bins": 4,
+    "block_size": 64,
+    "local_context_length": 512
+  },
+  "model": {
+    "checkpoint_path": "outputs/learnable_index_convomem_4096tokens_4096train_query_key_random_v1/training/best.pt",
+    "model_name": "google/gemma-4-E4B-it",
+    "model_cache_dir": "outputs/hf_cache/hub",
+    "local_files_only": true,
+    "device": "cuda",
+    "dtype": "bfloat16",
+    "router_device": "cuda",
+    "block_size": 64,
+    "local_context_length": 512,
+    "residual_layer": 40,
+    "query_summary_length": 16
+  },
+  "sweep": {
+    "maximum_variants": 8,
+    "base_memory_config": {
+      "slot_capacity": 128,
+      "initial_record_capacity": 4096,
+      "candidate_capacity": 8,
+      "locality_bits": 8,
+      "locality_probe_radius": 1,
+      "write_chunk_size": 64,
+      "alpha": 0.1,
+      "tau_new": 0.5,
+      "count_exponent": 0.5,
+      "concentration_prior_mass": 1.0,
+      "maximum_concentration": 1000.0,
+      "router_count_exponent": 0.5,
+      "router_concentration_prior_mass": 1.0,
+      "router_maximum_concentration": 1000.0,
+      "index_mode": "mean_kv",
+      "locality_seed": 13
+    },
+    "grid": {
+      "alpha": [0.0001, 0.1],
+      "tau_new": [0.95, 1.0]
+    }
+  },
+  "evaluation": {
+    "top_ns": [1, 4, 8],
+    "permutation_trials": 16
+  },
+  "criteria": {
+    "minimum_mean_bcubed_f1": 0.2,
+    "minimum_mean_b3_gain_over_permutation": 0.05,
+    "minimum_consistent_condition_fraction": 0.75,
+    "maximum_singleton_cluster_ratio": 0.6,
+    "minimum_mean_cluster_size": 2.0,
+    "maximum_mean_p95_cluster_size": 256.0,
+    "minimum_samples_for_structural_conclusion": 4
+  }
+}

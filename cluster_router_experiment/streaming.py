@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from contextlib import nullcontext
+from typing import Callable, ContextManager, Sequence
 
 import torch
 
 from learnable_index.contracts import BlockRange
 from learnable_index.model_adapter import (
     build_rolling_local_mask,
+    cache_from_layer_kv,
     cache_suffix,
     forward_tokens,
     hidden_state_at_layer,
@@ -74,6 +76,7 @@ class RollingContextCollector:
         on_block_ready: Callable[[BlockRange, torch.Tensor], None],
         on_evict: Callable[[EvictedStreamingBlock], None],
         progress: Callable[[int, int], None] | None = None,
+        forward_context: Callable[[], ContextManager] | None = None,
     ) -> RollingCollectionResult:
         full_blocks = mechanical_blocks(
             record.sequence_id, plan.local_context_end, self.block_size
@@ -103,8 +106,8 @@ class RollingContextCollector:
         for block in chunks:
             query_positions = tuple(range(block.start_position, block.end_position))
             past_positions = tuple(range(cache_start, block.start_position))
-            # The retained cache is 256 tokens.  One complete incoming block is
-            # allowed to extend the physical/effective forward context to 320;
+            # The configured local cache is retained. One complete incoming block is
+            # allowed to extend the physical/effective forward context by block_size;
             # only after that forward do we unload the oldest block.
             mask = build_rolling_local_mask(
                 self.bundle,
@@ -112,23 +115,31 @@ class RollingContextCollector:
                 query_positions=query_positions,
                 local_context_length=self.local_context_length + self.block_size,
             )
-            output = forward_tokens(
-                self.bundle,
-                record.token_ids[block.start_position : block.end_position],
-                query_positions,
-                past_key_values=cache,
-                attention_mask=mask,
-                use_cache=True,
-                output_hidden_states=True,
-                logical_cache_position=True,
-            )
-            cache = output.past_key_values
+            context = nullcontext() if forward_context is None else forward_context()
+            with context:
+                output = forward_tokens(
+                    self.bundle,
+                    record.token_ids[block.start_position : block.end_position],
+                    query_positions,
+                    past_key_values=cache,
+                    attention_mask=mask,
+                    use_cache=True,
+                    output_hidden_states=True,
+                    logical_cache_position=True,
+                )
+            # Re-wrap the returned cache without model config.  Otherwise
+            # Transformers installs DynamicSlidingWindowLayer and silently
+            # trims native sliding layers to ``sliding_window - 1`` past
+            # tokens, while full-attention layers retain the requested rolling
+            # context.  A config-free DynamicCache keeps all physical layers
+            # aligned for our explicit per-layer mask and later block unload.
+            cache = cache_from_layer_kv(layer_kv_from_cache(output.past_key_values))
             hidden = hidden_state_at_layer(output, self.residual_layer)[0].detach()
             summary = hidden.mean(dim=0)
             if block.end_position - block.start_position == self.block_size:
                 # The learned block key is available while this completed block
                 # is still the newest 64-token region of local context, long
-                # before its first token can leave a 256-token window.
+                # before its first token can leave the configured local window.
                 ready_blocks[block.block_id] = block
                 on_block_ready(block, summary)
             recent_hidden = (

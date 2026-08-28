@@ -40,7 +40,10 @@ def _module(layer_idx, *, shared=False, layer_type="full_attention"):
 def test_static_controller_injects_variable_prefix_and_maps_shared_layers():
     historical_key = torch.randn(1, 1, 3, 4)
     historical_value = torch.randn(1, 1, 3, 4)
-    controller = Gemma4StaticKVController({3: (historical_key, historical_value)})
+    controller = Gemma4StaticKVController(
+        {3: (historical_key, historical_value)},
+        collect_historical_usage=True,
+    )
     physical = _module(3)
     shared = _module(5, shared=True)
 
@@ -64,6 +67,9 @@ def test_static_controller_injects_variable_prefix_and_maps_shared_layers():
     assert output.shape == (1, 2, 2, 4)
     assert weights.shape == (1, 2, 2, 5)
     assert controller.retrieved_tokens_by_layer == {3: 3}
+    usage = controller.historical_usage_rates()[3]
+    assert usage.shape == (3,)
+    assert torch.allclose(usage, weights[..., :3].float().mean(dim=(0, 1, 2)))
 
 
 def test_evidence_only_prompt_removes_both_distractor_sides():
@@ -84,7 +90,7 @@ def test_evidence_only_prompt_removes_both_distractor_sides():
     assert evidence_length == 3
 
 
-def test_zero_dual_step_keeps_a_nonempty_memory_under_the_hard_cap():
+def test_legacy_budget_does_not_impose_a_global_hard_cap():
     budget = 2_000
     memory = HierarchicalVMFMemory(
         MemoryConfig(
@@ -104,6 +110,6 @@ def test_zero_dual_step_keeps_a_nonempty_memory_under_the_hard_cap():
         )
         memory.maintain()
 
-    assert 0 < memory.record_count < 20
-    assert memory.memory_bytes <= budget
+    assert memory.record_count == 20
+    assert memory.memory_bytes > budget
     assert memory.snapshot()["memory_cost_lambda"] == 0.0

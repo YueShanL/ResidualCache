@@ -338,7 +338,7 @@ class MaintenanceAndDynamicKVTests(unittest.TestCase):
         key = torch.full((1, 1, 1, 2), value, dtype=torch.float32)
         return KVRecordPayload(key=key, value=key + 10.0, logical_positions=(position,))
 
-    def test_eviction_removes_record_from_router_vmf_and_payload_store(self):
+    def test_recall_usage_eviction_removes_router_record_and_payload(self):
         memory = TemporalVMFMemory(
             MemoryConfig(
                 alpha=1e-9,
@@ -348,6 +348,9 @@ class MaintenanceAndDynamicKVTests(unittest.TestCase):
                 age_decay=1.0,
                 minimum_effective_weight=0.5,
                 new_record_protection=0.0,
+                eviction_enabled=True,
+                eviction_usage_threshold=0.1,
+                eviction_min_records_per_cluster=0,
             )
         )
         payload_store = KVPayloadStore()
@@ -365,7 +368,12 @@ class MaintenanceAndDynamicKVTests(unittest.TestCase):
         self.assertEqual(len(memory.retrieve_router_clusters((1.0, 0.0))), 1)
         self.assertEqual(len(payload_store), 1)
 
-        report = memory.maintain(time=2.0)
+        selected = memory.retrieve_router_clusters((1.0, 0.0))[0]
+        report = memory.observe_cluster_recall_usage(
+            selected.slot_id,
+            {selected.record_ids[0]: 0.0},
+            time=2.0,
+        )
         ingestor.synchronize()
 
         self.assertEqual(len(report.evicted_record_ids), 1)
