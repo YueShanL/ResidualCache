@@ -798,9 +798,13 @@ p_hat(b | M_t) = w_b / Z_M
 ```
 
 There is no learned demand head, student softmax, or local-history term in the
-normalizer. At inference, `p_hat(b | M_t) > tau` is exactly equivalent to the
-weight-space range condition `w_b > tau * Z_M`; the denominator is therefore
-retained even when candidate retrieval is implemented with a MIPS index.
+normalizer. At inference, `p` is a global missing-mass tolerance: the policy
+selects the smallest descending-probability set `R` satisfying
+`sum_{b in R} w_b >= (1 - p) Z_M`. Consequently `p = 0.02` retains at least
+98% of predicted mass. This cumulative rule preserves flat attention tails;
+filtering each block independently at 2% could incorrectly discard every
+block. A MIPS implementation must expand results or lower its range cutoff
+until the accumulated returned weight reaches the global target.
 
 The end-to-end runner is
 `scripts/run_block_probability_router_hpc.py`, with the controlled 4096-document

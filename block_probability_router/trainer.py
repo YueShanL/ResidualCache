@@ -18,7 +18,7 @@ from .metrics import MetricAccumulator, finite_metrics, update_probability_metri
 from .model import BlockProbabilityRouter
 
 
-CHECKPOINT_FORMAT_VERSION = 1
+CHECKPOINT_FORMAT_VERSION = 2
 MODEL_KIND = "positive_block_probability_router"
 
 
@@ -52,6 +52,7 @@ def _run_epoch(
     train_config: ProbabilityTrainConfig,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None,
+    maximum_retrieval_blocks: int = -1,
 ) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
@@ -76,7 +77,8 @@ def _run_epoch(
             output,
             batch,
             top_n=train_config.top_n,
-            probability_thresholds=train_config.probability_thresholds,
+            missing_mass_tolerances=train_config.missing_mass_tolerances,
+            maximum_retrieval_blocks=maximum_retrieval_blocks,
         )
     return finite_metrics(metrics.compute())
 
@@ -89,6 +91,7 @@ def evaluate_model(
     train_config: ProbabilityTrainConfig,
     *,
     device: torch.device | None = None,
+    maximum_retrieval_blocks: int = -1,
 ) -> dict[str, float]:
     device = device or resolve_device(train_config.device)
     model.to(device)
@@ -99,6 +102,7 @@ def evaluate_model(
         train_config,
         device,
         optimizer=None,
+        maximum_retrieval_blocks=maximum_retrieval_blocks,
     )
 
 
@@ -143,18 +147,22 @@ def load_checkpoint(
         payload = torch.load(path, map_location=map_location, weights_only=True)
     except TypeError:
         payload = torch.load(path, map_location=map_location)
-    if int(payload.get("format_version", 0)) != CHECKPOINT_FORMAT_VERSION:
+    format_version = int(payload.get("format_version", 0))
+    if format_version not in {1, CHECKPOINT_FORMAT_VERSION}:
         raise ValueError("unsupported probability-router checkpoint format")
     if payload.get("model_kind") != MODEL_KIND:
         raise ValueError("checkpoint is not a positive block-probability router")
     router_config = ProbabilityRouterConfig(**payload["router_config"])
     loss_config = ProbabilityLossConfig(**payload["loss_config"])
-    train_config = ProbabilityTrainConfig(
-        **{
-            **payload["train_config"],
-            "probability_thresholds": tuple(payload["train_config"]["probability_thresholds"]),
-        }
+    stored_train_config = dict(payload["train_config"])
+    if format_version == 1:
+        stored_train_config["missing_mass_tolerances"] = stored_train_config.pop(
+            "probability_thresholds"
+        )
+    stored_train_config["missing_mass_tolerances"] = tuple(
+        stored_train_config["missing_mass_tolerances"]
     )
+    train_config = ProbabilityTrainConfig(**stored_train_config)
     model = BlockProbabilityRouter(router_config)
     model.load_state_dict(payload["model_state_dict"])
     return model, router_config, loss_config, train_config, payload
@@ -195,6 +203,11 @@ def fit_router(
         "split_policy": "grouped_by_split_group_id_or_sequence_id",
         "teacher_target": "next_block_attention_conditioned_on_historical_memory",
         "normalization": "q_dot_sum_historical_key_features",
+        "retrieval_policy": {
+            "kind": "minimum_cumulative_probability_mass",
+            "parameter": "missing_mass_tolerance",
+            "retained_mass": "1 - missing_mass_tolerance",
+        },
         "information_boundary": {
             "query_input": "current_restricted_history",
             "key_input": "completed_historical_memory_blocks_only",

@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
-  "run_id": "block_probability_router_convomem_4096tokens_4096train_random_v1",
+  "run_id": "block_probability_router_convomem_4096tokens_4096train_global_mass_v2",
   "seed": 13,
   "paths": {
-    "output_root": "outputs/block_probability_router_convomem_4096tokens_4096train_random_v1",
+    "output_root": "outputs/block_probability_router_convomem_4096tokens_4096train_global_mass_v2",
     "use_tmp_workspace": true,
     "tmp_workspace_root": "/tmp"
   },
@@ -80,7 +80,7 @@
     "weight_decay": 0.0001,
     "validation_fraction": 0.1,
     "top_n": 4,
-    "probability_thresholds": [
+    "missing_mass_tolerances": [
       0.01,
       0.02,
       0.05,
@@ -90,7 +90,7 @@
   },
   "evaluation": {
     "top_n": 4,
-    "probability_thresholds": [
+    "missing_mass_tolerances": [
       0.01,
       0.02,
       0.05,

@@ -46,6 +46,52 @@ class ProbabilityRouterOutput:
     key_sum: torch.Tensor
 
 
+def minimum_cumulative_mass_mask(
+    probabilities: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    missing_mass_tolerance: float,
+    maximum_retrieval_blocks: int = -1,
+) -> torch.Tensor:
+    """Select the smallest descending-probability prefix retaining ``1 - p`` mass.
+
+    This is a global mass budget, not an independent per-block cutoff.  Flat
+    distributions therefore retain many blocks instead of dropping every
+    individually small block.
+    """
+
+    if probabilities.ndim != 2:
+        raise ValueError("probabilities must have shape [batch, blocks]")
+    if candidate_mask.shape != probabilities.shape:
+        raise ValueError("candidate_mask must align with probabilities")
+    if not 0 < missing_mass_tolerance < 1:
+        raise ValueError("missing_mass_tolerance must be in (0, 1)")
+    if maximum_retrieval_blocks != -1 and maximum_retrieval_blocks <= 0:
+        raise ValueError("maximum_retrieval_blocks must be -1 or a positive integer")
+    if torch.any(candidate_mask.sum(dim=-1) == 0):
+        raise ValueError("every sample must expose at least one candidate block")
+    if torch.any(probabilities[candidate_mask] < 0):
+        raise ValueError("candidate probabilities must be non-negative")
+
+    masked_probabilities = probabilities.masked_fill(~candidate_mask, -1.0)
+    order = masked_probabilities.argsort(dim=-1, descending=True)
+    sorted_probabilities = probabilities.gather(dim=-1, index=order)
+    sorted_candidates = candidate_mask.gather(dim=-1, index=order)
+    sorted_probabilities = sorted_probabilities * sorted_candidates.to(probabilities.dtype)
+    cumulative_mass = sorted_probabilities.cumsum(dim=-1)
+    mass_before_block = cumulative_mass - sorted_probabilities
+    retained_mass_target = 1.0 - missing_mass_tolerance
+    selected_sorted = sorted_candidates & (mass_before_block < retained_mass_target)
+    if maximum_retrieval_blocks != -1:
+        ranks = torch.arange(
+            selected_sorted.shape[-1],
+            device=selected_sorted.device,
+        ).unsqueeze(0)
+        selected_sorted &= ranks < maximum_retrieval_blocks
+    selected = torch.zeros_like(candidate_mask)
+    selected.scatter_(dim=-1, index=order, src=selected_sorted)
+    return selected
+
+
 class BlockProbabilityRouter(nn.Module):
     """Two-tower positive router with an explicit memory normalizer.
 
@@ -143,17 +189,15 @@ class BlockProbabilityRouter(nn.Module):
         )
 
     @staticmethod
-    def threshold_mask(
+    def cumulative_mass_mask(
         output: ProbabilityRouterOutput,
         candidate_mask: torch.Tensor,
-        threshold: float,
+        missing_mass_tolerance: float,
+        maximum_retrieval_blocks: int = -1,
     ) -> torch.Tensor:
-        if not 0 < threshold < 1:
-            raise ValueError("threshold must be in (0, 1)")
-        if candidate_mask.shape != output.weights.shape:
-            raise ValueError("candidate_mask must align with router output")
-        # p_b > threshold iff w_b > threshold * Z_M.  Keeping this in weight
-        # space is the range-search interface used by a MIPS implementation.
-        return candidate_mask & (
-            output.weights > threshold * output.normalizer.unsqueeze(-1)
+        return minimum_cumulative_mass_mask(
+            output.probabilities,
+            candidate_mask,
+            missing_mass_tolerance,
+            maximum_retrieval_blocks,
         )

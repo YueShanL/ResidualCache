@@ -45,7 +45,7 @@ class ProbabilityTrainConfig:
     seed: int = 13
     gradient_clip_norm: float = 1.0
     top_n: int = 4
-    probability_thresholds: tuple[float, ...] = (0.01, 0.02, 0.05, 0.1)
+    missing_mass_tolerances: tuple[float, ...] = (0.01, 0.02, 0.05, 0.1)
     device: str = "auto"
     num_workers: int = 0
 
@@ -64,9 +64,12 @@ class ProbabilityTrainConfig:
             raise ValueError("top_n must be positive")
         if self.num_workers < 0:
             raise ValueError("num_workers must be non-negative")
-        if not self.probability_thresholds:
-            raise ValueError("probability_thresholds cannot be empty")
-        if any(not 0 < threshold < 1 for threshold in self.probability_thresholds):
-            raise ValueError("every probability threshold must be in (0, 1)")
-        if tuple(sorted(set(self.probability_thresholds))) != self.probability_thresholds:
-            raise ValueError("probability_thresholds must be unique and sorted")
+        if not self.missing_mass_tolerances:
+            raise ValueError("missing_mass_tolerances cannot be empty")
+        if any(not 0 < tolerance < 1 for tolerance in self.missing_mass_tolerances):
+            raise ValueError("every missing-mass tolerance must be in (0, 1)")
+        if (
+            tuple(sorted(set(self.missing_mass_tolerances)))
+            != self.missing_mass_tolerances
+        ):
+            raise ValueError("missing_mass_tolerances must be unique and sorted")

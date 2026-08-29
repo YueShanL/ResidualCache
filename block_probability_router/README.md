@@ -28,14 +28,20 @@ p_hat(b | M_t) = w_b / Z_M
 The loss is cross entropy against the frozen teacher's conditional block
 distribution.  There is no demand head and no student softmax.
 
-At inference, probability-threshold retrieval is an exact range condition:
+At inference, the retrieval parameter is a global missing-mass tolerance
+`epsilon`. The router returns the smallest descending-probability prefix whose
+total predicted mass reaches `1 - epsilon`:
 
 ```text
-p_hat(b | M_t) > tau  <=>  w_b > tau * Z_M
+choose the smallest R such that
+sum_{b in R} w_b >= (1 - epsilon) * Z_M
 ```
 
-This leaves candidate search free to use a MIPS/range index while preserving
-the denominator needed for calibrated probabilities.
+Thus `epsilon = 0.02` targets 98% retained probability mass. This global rule
+is essential for flat attention: many individually small blocks are retained
+when their combined tail is large. A MIPS implementation can expand its result
+set or lower a range cutoff until the returned weight sum reaches the global
+target; a single fixed per-block cutoff is not a valid substitute.
 
 ## Commands
 
@@ -45,6 +51,7 @@ Train from any existing aligned collection:
 python -m block_probability_router train \
   --dataset-dir outputs/.../collection/train/dataset \
   --output-dir outputs/.../training \
+  --missing-mass-tolerances 0.01,0.02,0.05,0.1 \
   --device cuda
 ```
 
@@ -55,6 +62,28 @@ validation/test pipeline from a JSON config:
 python scripts/run_block_probability_router_hpc.py \
   --config configs/block_probability_router_convomem4096_hpc.json
 ```
+
+Evaluate an existing checkpoint without entering the training pipeline:
+
+```bash
+python scripts/run_block_probability_router_evaluation_hpc.py \
+  --config configs/block_probability_router_evaluation_convomem4096_hpc.json
+```
+
+The independent evaluation config accepts either one number or a sorted list in
+`evaluation.epsilon`. `evaluation.max_block` is applied after cumulative-mass
+selection: `-1` disables the hard retrieval limit, while a positive integer
+caps the number of returned blocks. When the cap prevents the requested
+`1 - epsilon` mass from being reached, the output reports the cap application
+rate, truncated block count, target success rate, and mass shortfall instead of
+silently treating the capped result as successful. The default evaluation
+device is CPU because this router is small; the frozen Gemma collection stage
+still runs on the configured model device.
+
+With `paths.use_tmp_workspace=true`, synthesized inputs, aligned collections,
+model caches, and event logs stay below `paths.tmp_workspace_root` and are
+removed after a successful run. Only `metrics.json` is copied to
+`paths.output_root`.
 
 The example deliberately preserves the previous experiment's controlled
 variables: Gemma-4 E4B IT, layer-40 query/key summaries, teacher layers

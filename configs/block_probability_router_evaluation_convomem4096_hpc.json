@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "run_id": "block_probability_router_evaluation_convomem4096_smoke16_v1",
+  "seed": 13,
+  "paths": {
+    "output_root": "outputs/block_probability_router_evaluation_convomem4096_smoke16_v1",
+    "use_tmp_workspace": true,
+    "tmp_workspace_root": "/tmp"
+  },
+  "model": {
+    "name": "google/gemma-4-E4B-it",
+    "device": "cuda",
+    "dtype": "bfloat16",
+    "allow_network": true
+  },
+  "router": {
+    "checkpoint": "outputs/block_probability_router_convomem_4096tokens_4096train_random_v1/training/best.pt"
+  },
+  "data": {
+    "source": "convomem",
+    "dataset_name": "Salesforce/ConvoMem",
+    "cache_dir": null,
+    "allow_network": true,
+    "split": "test",
+    "sequences": 16,
+    "sequence_length": 4096,
+    "maximum_answer_tokens": 64,
+    "maximum_future_horizon": 64,
+    "evidence_placement": "stratified_random",
+    "evidence_placement_bins": 4,
+    "placement_block_size": 64,
+    "retrieval_local_context_length": 256,
+    "sampling_seed": 197,
+    "persist_prepared_inputs": false
+  },
+  "collection": {
+    "local_context_length": 256,
+    "block_size": 64,
+    "future_horizon": 64,
+    "retrieval_interval": 128,
+    "retrieval_point_policy": "metadata",
+    "minimum_candidate_blocks": 2,
+    "maximum_candidate_blocks": null,
+    "teacher_prefill_chunk_size": 256,
+    "residual_layer": 40,
+    "query_summary": "mean",
+    "query_summary_length": 16,
+    "teacher_layers": [
+      29,
+      35,
+      41
+    ],
+    "teacher_heads": "all",
+    "future_reduction": "mean",
+    "length_normalize_blocks": false,
+    "progress_every": 1
+  },
+  "evaluation": {
+    "epsilon": [
+      0.02,
+      0.05,
+      0.1
+    ],
+    "max_block": -1,
+    "top_n": 4,
+    "device": "cpu"
+  }
+}

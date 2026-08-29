@@ -50,7 +50,7 @@ def test_hpc_train_and_evaluation_use_independent_module_entry(tmp_path, monkeyp
     train = commands[0][1]
     assert train[:3] == ["-m", "block_probability_router", "train"]
     assert "--temperature" not in train
-    assert train[train.index("--probability-thresholds") + 1] == "0.01,0.02,0.05,0.1"
+    assert train[train.index("--missing-mass-tolerances") + 1] == "0.01,0.02,0.05,0.1"
     assert [stage for stage, _ in commands[1:]] == ["evaluate:validation", "evaluate:test"]
     assert all(command[:3] == ["-m", "block_probability_router", "evaluate"] for _, command in commands[1:])
 

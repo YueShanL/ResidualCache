@@ -48,9 +48,15 @@ def validate_hpc_config(config: dict[str, Any]) -> None:
         raise ValueError("router.positive_floor must be positive")
     if float(router.get("normalization_epsilon", 1e-12)) <= 0:
         raise ValueError("router.normalization_epsilon must be positive")
-    thresholds = tuple(float(value) for value in config["training"]["probability_thresholds"])
-    if tuple(sorted(set(thresholds))) != thresholds or any(not 0 < value < 1 for value in thresholds):
-        raise ValueError("training.probability_thresholds must be sorted, unique, and in (0, 1)")
+    tolerances = tuple(
+        float(value) for value in config["training"]["missing_mass_tolerances"]
+    )
+    if tuple(sorted(set(tolerances))) != tolerances or any(
+        not 0 < value < 1 for value in tolerances
+    ):
+        raise ValueError(
+            "training.missing_mass_tolerances must be sorted, unique, and in (0, 1)"
+        )
 
 
 class HPCPipeline(AlignedCollectionHPCPipeline):
@@ -137,8 +143,8 @@ class HPCPipeline(AlignedCollectionHPCPipeline):
             str(train["validation_fraction"]),
             "--top-n",
             str(train["top_n"]),
-            "--probability-thresholds",
-            ",".join(str(value) for value in train["probability_thresholds"]),
+            "--missing-mass-tolerances",
+            ",".join(str(value) for value in train["missing_mass_tolerances"]),
             "--seed",
             str(self.config.get("seed", 13)),
             "--device",
@@ -155,9 +161,9 @@ class HPCPipeline(AlignedCollectionHPCPipeline):
             return
         checkpoint = self.output_root / "training" / "best.pt"
         evaluation = self.config["evaluation"]
-        thresholds = evaluation.get(
-            "probability_thresholds",
-            self.config["training"]["probability_thresholds"],
+        tolerances = evaluation.get(
+            "missing_mass_tolerances",
+            self.config["training"]["missing_mass_tolerances"],
         )
         for split in ("validation", "test"):
             output = self.output_root / "evaluation" / f"{split}.json"
@@ -180,8 +186,8 @@ class HPCPipeline(AlignedCollectionHPCPipeline):
                     str(evaluation["device"]),
                     "--top-n",
                     str(evaluation["top_n"]),
-                    "--probability-thresholds",
-                    ",".join(str(value) for value in thresholds),
+                    "--missing-mass-tolerances",
+                    ",".join(str(value) for value in tolerances),
                 ],
             )
 

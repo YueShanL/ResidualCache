@@ -20,8 +20,9 @@ target fact better than chance.
 - `block_probability_router/`: independent positive two-tower successor that
   reuses only the aligned collection contract. It learns normalized
   next-block memory probabilities with an explicit `q dot sum(keys)`
-  denominator and supports probability-threshold retrieval without changing
-  the legacy router.
+  denominator and global cumulative-mass retrieval without changing the legacy
+  router. Its checkpoint-only HPC evaluator supports configurable missing mass
+  and an optional hard retrieval-block limit without invoking training.
 - `cluster_router_bridge/`: independent integration which splits blocks,
   transports learned keys into memory-owned record metadata, invokes the
   memory-owned per-leaf router-vMF index, and packs selected clusters into

@@ -7,7 +7,11 @@ legacy softmax-logit router.
 """
 
 from .config import ProbabilityLossConfig, ProbabilityRouterConfig, ProbabilityTrainConfig
-from .model import BlockProbabilityRouter, ProbabilityRouterOutput
+from .model import (
+    BlockProbabilityRouter,
+    ProbabilityRouterOutput,
+    minimum_cumulative_mass_mask,
+)
 
 __all__ = [
     "BlockProbabilityRouter",
@@ -15,4 +19,5 @@ __all__ = [
     "ProbabilityRouterConfig",
     "ProbabilityRouterOutput",
     "ProbabilityTrainConfig",
+    "minimum_cumulative_mass_mask",
 ]

@@ -8,7 +8,11 @@ import torch
 
 from learnable_index.data import RetrievalBatch
 
-from .model import BlockProbabilityRouter, ProbabilityRouterOutput
+from .model import (
+    BlockProbabilityRouter,
+    ProbabilityRouterOutput,
+    minimum_cumulative_mass_mask,
+)
 
 
 class MetricAccumulator:
@@ -32,7 +36,7 @@ class MetricAccumulator:
         }
 
 
-def _threshold_label(value: float) -> str:
+def _mass_label(value: float) -> str:
     return format(value, ".6g")
 
 
@@ -43,7 +47,8 @@ def update_probability_metrics(
     batch: RetrievalBatch,
     *,
     top_n: int,
-    probability_thresholds: tuple[float, ...],
+    missing_mass_tolerances: tuple[float, ...],
+    maximum_retrieval_blocks: int = -1,
     epsilon: float = 1e-8,
 ) -> None:
     mask = batch.candidate_mask
@@ -90,24 +95,114 @@ def update_probability_metrics(
         accumulator.add(f"predicted_conditional_coverage@{top_n}", torch.stack(predicted_coverage))
         accumulator.add(f"oracle_conditional_coverage@{top_n}", torch.stack(oracle_coverage))
 
-    for threshold in probability_thresholds:
-        selected = BlockProbabilityRouter.threshold_mask(output, mask, threshold)
+    for tolerance in missing_mass_tolerances:
+        uncapped_selected = BlockProbabilityRouter.cumulative_mass_mask(
+            output,
+            mask,
+            tolerance,
+        )
+        selected = BlockProbabilityRouter.cumulative_mass_mask(
+            output,
+            mask,
+            tolerance,
+            maximum_retrieval_blocks,
+        )
         selected_count = selected.sum(dim=-1)
+        uncapped_selected_count = uncapped_selected.sum(dim=-1)
         candidate_count = mask.sum(dim=-1)
-        label = _threshold_label(threshold)
-        accumulator.add(f"threshold/{label}/selected_blocks", selected_count)
+        label = _mass_label(tolerance)
+        prefix = f"missing_mass/{label}"
+        retained_mass_target = 1.0 - tolerance
+        predicted_mass = (probabilities * selected.to(probabilities.dtype)).sum(dim=-1)
+        accumulator.add(f"{prefix}/retained_mass_target", torch.full_like(predicted_mass, retained_mass_target))
+        accumulator.add(f"{prefix}/selected_blocks", selected_count)
         accumulator.add(
-            f"threshold/{label}/selected_fraction",
+            f"{prefix}/selected_fraction",
             selected_count.float() / candidate_count.clamp_min(1),
         )
-        accumulator.add(f"threshold/{label}/empty_rate", (selected_count == 0).float())
+        accumulator.add(f"{prefix}/predicted_probability_mass", predicted_mass)
         accumulator.add(
-            f"threshold/{label}/predicted_probability_mass",
-            (probabilities * selected.to(probabilities.dtype)).sum(dim=-1),
+            f"{prefix}/predicted_target_success_rate",
+            (predicted_mass >= retained_mass_target - epsilon).float(),
         )
+        if maximum_retrieval_blocks != -1:
+            truncated_blocks = uncapped_selected_count - selected_count
+            accumulator.add(
+                f"{prefix}/maximum_retrieval_blocks",
+                torch.full_like(selected_count, maximum_retrieval_blocks),
+            )
+            accumulator.add(
+                f"{prefix}/uncapped_selected_blocks",
+                uncapped_selected_count,
+            )
+            accumulator.add(f"{prefix}/truncated_blocks", truncated_blocks)
+            accumulator.add(
+                f"{prefix}/cap_applied_rate",
+                (truncated_blocks > 0).float(),
+            )
         if torch.any(eligible):
             captured = (target * selected.to(target.dtype)).sum(dim=-1)
-            accumulator.add(f"threshold/{label}/teacher_mass_recall", captured[eligible])
+            eligible_target = target[eligible]
+            eligible_mask = mask[eligible]
+            oracle_uncapped_selected = minimum_cumulative_mass_mask(
+                eligible_target,
+                eligible_mask,
+                tolerance,
+            )
+            oracle_selected = minimum_cumulative_mass_mask(
+                eligible_target,
+                eligible_mask,
+                tolerance,
+                maximum_retrieval_blocks,
+            )
+            oracle_count = oracle_selected.sum(dim=-1)
+            oracle_uncapped_count = oracle_uncapped_selected.sum(dim=-1)
+            oracle_mass = (
+                eligible_target * oracle_selected.to(eligible_target.dtype)
+            ).sum(dim=-1)
+            eligible_captured = captured[eligible]
+            accumulator.add(f"{prefix}/teacher_mass_recall", eligible_captured)
+            accumulator.add(f"{prefix}/oracle_selected_blocks", oracle_count)
+            accumulator.add(f"{prefix}/oracle_teacher_mass", oracle_mass)
+            accumulator.add(
+                f"{prefix}/oracle_target_success_rate",
+                (oracle_mass >= retained_mass_target - epsilon).float(),
+            )
+            accumulator.add(
+                f"{prefix}/oracle_mass_shortfall",
+                (retained_mass_target - oracle_mass).clamp_min(0.0),
+            )
+            accumulator.add(
+                f"{prefix}/selected_blocks_minus_oracle",
+                selected_count[eligible].float() - oracle_count.float(),
+            )
+            if maximum_retrieval_blocks != -1:
+                oracle_truncated = oracle_uncapped_count - oracle_count
+                accumulator.add(
+                    f"{prefix}/oracle_uncapped_selected_blocks",
+                    oracle_uncapped_count,
+                )
+                accumulator.add(
+                    f"{prefix}/oracle_truncated_blocks",
+                    oracle_truncated,
+                )
+                accumulator.add(
+                    f"{prefix}/oracle_cap_applied_rate",
+                    (oracle_truncated > 0).float(),
+                )
+                accumulator.add(
+                    f"{prefix}/uncapped_selected_blocks_minus_oracle",
+                    uncapped_selected_count[eligible].float()
+                    - oracle_uncapped_count.float(),
+                )
+            accumulator.add(
+                f"{prefix}/teacher_target_success_rate",
+                (eligible_captured >= retained_mass_target - epsilon).float(),
+            )
+            accumulator.add(
+                f"{prefix}/teacher_mass_shortfall",
+                (retained_mass_target - eligible_captured).clamp_min(0.0),
+            )
 
 
 def finite_metrics(metrics: dict[str, float]) -> dict[str, float]:

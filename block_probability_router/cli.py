@@ -12,12 +12,12 @@ from .config import ProbabilityLossConfig, ProbabilityRouterConfig, ProbabilityT
 from .trainer import evaluate_model, fit_router, load_checkpoint
 
 
-def _parse_thresholds(specification: str) -> tuple[float, ...]:
+def _parse_missing_mass_tolerances(specification: str) -> tuple[float, ...]:
     values = tuple(sorted({float(value.strip()) for value in specification.split(",") if value.strip()}))
     if not values:
-        raise ValueError("probability threshold list cannot be empty")
+        raise ValueError("missing-mass tolerance list cannot be empty")
     if any(not 0 < value < 1 for value in values):
-        raise ValueError("every probability threshold must be in (0, 1)")
+        raise ValueError("every missing-mass tolerance must be in (0, 1)")
     return values
 
 
@@ -35,7 +35,11 @@ def _add_training_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--validation-fraction", type=float, default=0.1)
     parser.add_argument("--top-n", type=int, default=4)
-    parser.add_argument("--probability-thresholds", default="0.01,0.02,0.05,0.1")
+    parser.add_argument(
+        "--missing-mass-tolerances",
+        default="0.01,0.02,0.05,0.1",
+        help="global probability mass allowed to be omitted; 0.02 retains at least 0.98",
+    )
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--device", default="auto")
 
@@ -57,7 +61,13 @@ def _build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--output", type=Path)
     evaluate.add_argument("--device", default="auto")
     evaluate.add_argument("--top-n", type=int)
-    evaluate.add_argument("--probability-thresholds")
+    evaluate.add_argument("--missing-mass-tolerances")
+    evaluate.add_argument(
+        "--max-block",
+        type=int,
+        default=-1,
+        help="hard retrieval-block limit applied after cumulative-mass selection; -1 disables it",
+    )
     return parser
 
 
@@ -80,7 +90,9 @@ def _train(arguments: argparse.Namespace) -> dict:
         weight_decay=arguments.weight_decay,
         validation_fraction=arguments.validation_fraction,
         top_n=arguments.top_n,
-        probability_thresholds=_parse_thresholds(arguments.probability_thresholds),
+        missing_mass_tolerances=_parse_missing_mass_tolerances(
+            arguments.missing_mass_tolerances
+        ),
         seed=arguments.seed,
         device=arguments.device,
     )
@@ -100,16 +112,18 @@ def _train(arguments: argparse.Namespace) -> dict:
 
 
 def _evaluate(arguments: argparse.Namespace) -> dict:
+    if arguments.max_block != -1 and arguments.max_block <= 0:
+        raise ValueError("max_block must be -1 or a positive integer")
     dataset, _ = load_dataset(arguments.dataset_dir)
     model, _, loss_config, stored_config, payload = load_checkpoint(arguments.checkpoint)
     train_config = replace(
         stored_config,
         device=arguments.device,
         top_n=arguments.top_n if arguments.top_n is not None else stored_config.top_n,
-        probability_thresholds=(
-            _parse_thresholds(arguments.probability_thresholds)
-            if arguments.probability_thresholds is not None
-            else stored_config.probability_thresholds
+        missing_mass_tolerances=(
+            _parse_missing_mass_tolerances(arguments.missing_mass_tolerances)
+            if arguments.missing_mass_tolerances is not None
+            else stored_config.missing_mass_tolerances
         ),
     )
     metrics = evaluate_model(
@@ -118,11 +132,17 @@ def _evaluate(arguments: argparse.Namespace) -> dict:
         loss_config,
         train_config,
         device=resolve_device(arguments.device),
+        maximum_retrieval_blocks=arguments.max_block,
     )
     result = {
         "checkpoint": str(arguments.checkpoint),
         "checkpoint_epoch": payload["epoch"],
         "sample_count": len(dataset),
+        "retrieval_policy": {
+            "kind": "minimum_cumulative_probability_mass",
+            "missing_mass_tolerances": list(train_config.missing_mass_tolerances),
+            "max_block": arguments.max_block,
+        },
         "metrics": metrics,
     }
     if arguments.output is not None:
