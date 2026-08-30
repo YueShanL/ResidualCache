@@ -21,6 +21,8 @@ from learnable_index.hpc import (
 
 
 OUTPUT_NAME = "metrics.json"
+QA_OUTPUT_NAME = "qa_metrics.json"
+QA_SAMPLES_NAME = "qa_samples.jsonl"
 
 
 def _epsilon_values(config: dict[str, Any]) -> tuple[float, ...]:
@@ -77,7 +79,15 @@ def _temporary_output_path(config: dict[str, Any]) -> Path:
 def validate_evaluation_hpc_config(config: dict[str, Any]) -> None:
     if int(config.get("schema_version", 0)) != 1:
         raise ValueError("HPC config schema_version must be 1")
-    for section in ("paths", "model", "router", "data", "collection", "evaluation"):
+    for section in (
+        "paths",
+        "model",
+        "router",
+        "data",
+        "collection",
+        "evaluation",
+        "qa",
+    ):
         if section not in config:
             raise ValueError(f"missing config section: {section}")
     if not str(config.get("run_id", "")).strip():
@@ -176,6 +186,23 @@ def validate_evaluation_hpc_config(config: dict[str, Any]) -> None:
         raise ValueError("evaluation.top_n must be positive")
     if not str(evaluation.get("device", "cpu")).strip():
         raise ValueError("evaluation.device must be non-empty")
+
+    qa = config["qa"]
+    if not isinstance(qa.get("enabled", True), bool):
+        raise ValueError("qa.enabled must be a boolean")
+    for field in ("maximum_new_tokens", "prefill_chunk_size", "bootstrap_iterations"):
+        if int(qa.get(field, 0)) <= 0:
+            raise ValueError(f"qa.{field} must be positive")
+    if int(qa.get("progress_every", 10)) < 0:
+        raise ValueError("qa.progress_every must be non-negative")
+    maximum_qa_samples = qa.get("maximum_samples")
+    if maximum_qa_samples is not None:
+        if int(maximum_qa_samples) <= 0:
+            raise ValueError("qa.maximum_samples must be positive when set")
+        if int(maximum_qa_samples) > int(data["sequences"]):
+            raise ValueError("qa.maximum_samples cannot exceed data.sequences")
+    if not str(qa.get("router_device", "cpu")).strip():
+        raise ValueError("qa.router_device must be non-empty")
     _checkpoint_path(config)
 
 
@@ -186,7 +213,7 @@ def _index_specification(value: Any) -> str:
 
 
 class EvaluationHPCPipeline:
-    """Synthesize, collect, and evaluate one frozen router checkpoint."""
+    """Synthesize, collect, score, and autoregressively QA one router checkpoint."""
 
     def __init__(self, config: dict[str, Any]) -> None:
         validate_evaluation_hpc_config(config)
@@ -252,6 +279,12 @@ class EvaluationHPCPipeline:
 
     def _metrics_path(self) -> Path:
         return self.output_root / OUTPUT_NAME
+
+    def _qa_output_path(self) -> Path:
+        return self.output_root / QA_OUTPUT_NAME
+
+    def _qa_samples_path(self) -> Path:
+        return self.output_root / QA_SAMPLES_NAME
 
     def _emit(self, event: str, **fields: Any) -> None:
         row = {"time": _utc_now(), "event": event, **fields}
@@ -509,6 +542,77 @@ class EvaluationHPCPipeline:
             encoding="utf-8",
         )
 
+    def qa(self) -> None:
+        qa = self.config["qa"]
+        if not bool(qa.get("enabled", True)):
+            self._emit("stage_skip", stage="qa", reason="disabled")
+            return
+        metrics_path = self._metrics_path()
+        if not metrics_path.is_file():
+            raise RuntimeError("router metrics must exist before QA evaluation")
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        if "qa" in metrics:
+            self._emit("stage_skip", stage="qa", reason="complete")
+            return
+
+        tolerances = _epsilon_values(self.config)
+        arguments = [
+            "-m",
+            "block_probability_router.qa",
+            "--collection-dir",
+            str(self._collection_dir()),
+            "--checkpoint",
+            str(_checkpoint_path(self.config)),
+            "--output",
+            str(self._qa_output_path()),
+            "--samples-output",
+            str(self._qa_samples_path()),
+            "--model-name",
+            str(self.config["model"]["name"]),
+            "--model-device",
+            str(self.config["model"]["device"]),
+            "--dtype",
+            str(self.config["model"]["dtype"]),
+            "--router-device",
+            str(qa.get("router_device", "cpu")),
+            "--missing-mass-tolerances",
+            ",".join(str(value) for value in tolerances),
+            "--max-block",
+            str(_max_block(self.config)),
+            "--maximum-new-tokens",
+            str(qa["maximum_new_tokens"]),
+            "--prefill-chunk-size",
+            str(qa["prefill_chunk_size"]),
+            "--progress-every",
+            str(qa.get("progress_every", 10)),
+            "--bootstrap-iterations",
+            str(qa["bootstrap_iterations"]),
+            "--seed",
+            str(self.config.get("seed", 13)),
+        ]
+        if qa.get("maximum_samples") is not None:
+            arguments.extend(["--maximum-samples", str(qa["maximum_samples"])])
+        if self.config["model"].get("cache_dir"):
+            arguments.extend(
+                ["--model-cache-dir", str(self.config["model"]["cache_dir"])]
+            )
+        if bool(self.config["model"].get("allow_network", False)):
+            arguments.append("--allow-network")
+        self._run_command("qa", arguments)
+
+        qa_result = json.loads(self._qa_output_path().read_text(encoding="utf-8"))
+        expected_samples = int(
+            qa.get("maximum_samples") or self.config["data"]["sequences"]
+        )
+        if int(qa_result.get("summary", {}).get("sample_count", -1)) != expected_samples:
+            raise RuntimeError("QA result sample count does not match the config")
+        qa_result["per_sample_artifact_retained"] = False
+        metrics["qa"] = qa_result
+        metrics_path.write_text(
+            json.dumps(metrics, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
     def _export(self) -> None:
         if not self.use_tmp_workspace:
             return
@@ -556,6 +660,7 @@ class EvaluationHPCPipeline:
             checkpoint=str(checkpoint),
             epsilon=list(_epsilon_values(self.config)),
             max_block=_max_block(self.config),
+            qa_enabled=bool(self.config["qa"].get("enabled", True)),
             slurm_job_id=os.environ.get("SLURM_JOB_ID"),
         )
         self.prepare()
@@ -563,6 +668,7 @@ class EvaluationHPCPipeline:
         if (self._collection_dir() / "collection_manifest.json").is_file():
             self._cleanup_prepared_input()
         self.evaluate()
+        self.qa()
         self._export()
         self._emit("pipeline_complete", metrics=OUTPUT_NAME)
         self._cleanup_tmp_workspace()
@@ -597,6 +703,14 @@ def main(argv: list[str] | None = None) -> int:
                     "checkpoint": str(_checkpoint_path(config)),
                     "epsilon": list(_epsilon_values(config)),
                     "max_block": _max_block(config),
+                    "qa": {
+                        "enabled": bool(config["qa"].get("enabled", True)),
+                        "maximum_samples": config["qa"].get("maximum_samples"),
+                        "maximum_new_tokens": int(
+                            config["qa"]["maximum_new_tokens"]
+                        ),
+                        "teacher_forcing": False,
+                    },
                 },
                 indent=2,
             )

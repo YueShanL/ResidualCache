@@ -815,6 +815,19 @@ mode exports the best model, training curve/summary, and official
 validation/test metrics while discarding synthesized rows, aligned collection,
 model cache, and transient state.
 
+Checkpoint validation is independently driven by
+`scripts/run_block_probability_router_evaluation_hpc.py` and
+`configs/block_probability_router_evaluation_convomem4096_hpc.json`. The
+committed configuration consumes all 290 official test examples and sweeps
+missing-mass tolerances 0.02, 0.05, 0.1, 0.2, and 0.5. In addition to the
+teacher-attention routing diagnostics, it now performs greedy autoregressive
+QA (no gold-answer teacher forcing) for full context, evidence-only upper
+bound, local-only, and every router tolerance. Retrieved block KV preserves
+original logical positions and augments physical full-attention layers only;
+sliding-attention layers keep the native restricted window. Temporary mode
+exports one combined aggregate `metrics.json`; generated inputs, aligned
+states, and per-sample predictions are removed with the job workspace.
+
 ## Decision Log
 
 The following decisions are fixed for the first implementation:

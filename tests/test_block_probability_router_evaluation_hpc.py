@@ -32,12 +32,15 @@ def test_evaluation_config_exposes_mass_and_optional_block_limit(tmp_path):
     config = _config(tmp_path)
     validate_evaluation_hpc_config(config)
 
-    assert config["evaluation"]["epsilon"] == [0.02, 0.05, 0.1]
+    assert config["evaluation"]["epsilon"] == [0.02, 0.05, 0.1, 0.2, 0.5]
     assert config["evaluation"]["max_block"] == -1
-    assert config["data"]["sequences"] == 16
+    assert config["data"]["sequences"] == 290
     assert config["data"]["sequence_length"] == 4096
     assert config["collection"]["residual_layer"] == 40
     assert config["collection"]["teacher_layers"] == [29, 35, 41]
+    assert config["qa"]["enabled"] is True
+    assert config["qa"]["maximum_samples"] is None
+    assert config["qa"]["maximum_new_tokens"] == 64
 
 
 def test_scalar_epsilon_and_omitted_max_block_are_valid(tmp_path):
@@ -78,7 +81,7 @@ def test_independent_pipeline_collects_then_evaluates_without_training(
                     {
                         "checkpoint": command[command.index("--checkpoint") + 1],
                         "checkpoint_epoch": 8,
-                        "sample_count": 16,
+                        "sample_count": 290,
                         "retrieval_policy": {},
                         "metrics": {},
                     }
@@ -98,11 +101,58 @@ def test_independent_pipeline_collects_then_evaluates_without_training(
     assert "--no-store-kv-payload" in commands[1][1]
     evaluate = commands[2][1]
     assert evaluate[:3] == ["-m", "block_probability_router", "evaluate"]
-    assert evaluate[evaluate.index("--missing-mass-tolerances") + 1] == "0.02,0.05,0.1"
+    assert (
+        evaluate[evaluate.index("--missing-mass-tolerances") + 1]
+        == "0.02,0.05,0.1,0.2,0.5"
+    )
     assert evaluate[evaluate.index("--max-block") + 1] == "-1"
     result = json.loads(pipeline._metrics_path().read_text(encoding="utf-8"))
     assert result["config_fingerprint"] == pipeline.fingerprint
-    assert result["data"]["sequence_count"] == 16
+    assert result["data"]["sequence_count"] == 290
+
+
+def test_qa_stage_runs_autoregressive_evaluator_and_merges_summary(
+    tmp_path,
+    monkeypatch,
+):
+    pipeline = EvaluationHPCPipeline(_config(tmp_path))
+    pipeline.output_root.mkdir(parents=True, exist_ok=True)
+    pipeline._metrics_path().write_text(
+        json.dumps({"config_fingerprint": pipeline.fingerprint}),
+        encoding="utf-8",
+    )
+    commands = []
+
+    def fake_run(stage, arguments):
+        command = list(arguments)
+        commands.append((stage, command))
+        output = Path(command[command.index("--output") + 1])
+        output.write_text(
+            json.dumps(
+                {
+                    "qa_schema_version": 1,
+                    "evaluation_kind": "greedy_autoregressive_long_context_qa",
+                    "teacher_forcing": False,
+                    "summary": {"sample_count": 290, "conditions": {}},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(pipeline, "_run_command", fake_run)
+    pipeline.qa()
+
+    assert [stage for stage, _ in commands] == ["qa"]
+    qa_command = commands[0][1]
+    assert qa_command[:2] == ["-m", "block_probability_router.qa"]
+    assert qa_command[qa_command.index("--max-block") + 1] == "-1"
+    assert (
+        qa_command[qa_command.index("--missing-mass-tolerances") + 1]
+        == "0.02,0.05,0.1,0.2,0.5"
+    )
+    result = json.loads(pipeline._metrics_path().read_text(encoding="utf-8"))
+    assert result["qa"]["teacher_forcing"] is False
+    assert result["qa"]["per_sample_artifact_retained"] is False
 
 
 def test_tmp_workspace_exports_only_metrics_and_is_safely_removed(tmp_path):

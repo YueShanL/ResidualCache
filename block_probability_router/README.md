@@ -70,6 +70,25 @@ python scripts/run_block_probability_router_evaluation_hpc.py \
   --config configs/block_probability_router_evaluation_convomem4096_hpc.json
 ```
 
+The committed evaluation config is the full official 290-example ConvoMem test
+run.  After attention/retrieval diagnostics it performs greedy autoregressive
+QA without teacher forcing under these conditions:
+
+- `full_context`: the complete prompt prefix from the synthesized 4096-token
+  sequence;
+- `evidence_only`: the correct memory conversation plus the final question;
+- `local_only`: the native restricted local window;
+- `router_epsilon_<epsilon>`: the same local window augmented with the blocks
+  selected by each cumulative missing-mass tolerance.
+
+Router-selected block K/V retains the original logical positions and augments
+only physical full-attention layers. Sliding-attention layers keep their native
+local window. The report includes exact match, token F1, answer containment,
+95% bootstrap intervals, paired deltas against all three baselines, evidence
+block recall, retained teacher/predicted mass, selected-block fraction, and a
+visible layer-token KV ratio. This is an answer-generation test; the gold
+answer is never fed back during decoding.
+
 The independent evaluation config accepts either one number or a sorted list in
 `evaluation.epsilon`. `evaluation.max_block` is applied after cumulative-mass
 selection: `-1` disables the hard retrieval limit, while a positive integer
@@ -81,8 +100,9 @@ device is CPU because this router is small; the frozen Gemma collection stage
 still runs on the configured model device.
 
 With `paths.use_tmp_workspace=true`, synthesized inputs, aligned collections,
-model caches, and event logs stay below `paths.tmp_workspace_root` and are
-removed after a successful run. Only `metrics.json` is copied to
+per-sample QA predictions, model caches, and event logs stay below
+`paths.tmp_workspace_root` and are removed after a successful run. Only the
+combined router and aggregate QA `metrics.json` is copied to
 `paths.output_root`.
 
 The example deliberately preserves the previous experiment's controlled
