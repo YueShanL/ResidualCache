@@ -115,6 +115,7 @@ def _save_checkpoint(
     train_config: ProbabilityTrainConfig,
     epoch: int,
     metrics: dict[str, Any],
+    student_state_protocol: str | None,
 ) -> None:
     torch.save(
         {
@@ -127,6 +128,7 @@ def _save_checkpoint(
             "train_config": asdict(train_config),
             "epoch": epoch,
             "metrics": metrics,
+            "student_state_protocol": student_state_protocol,
         },
         path,
     )
@@ -174,6 +176,8 @@ def fit_router(
     router_config: ProbabilityRouterConfig,
     loss_config: ProbabilityLossConfig,
     train_config: ProbabilityTrainConfig,
+    *,
+    student_state_protocol: str | None = None,
 ) -> list[dict[str, Any]]:
     if dataset.residual_dim != router_config.residual_dim:
         raise ValueError("dataset residual dimension does not match router config")
@@ -263,6 +267,7 @@ def fit_router(
                     train_config,
                     epoch,
                     row,
+                    student_state_protocol,
                 )
             else:
                 epochs_without_improvement += 1
@@ -283,6 +288,7 @@ def fit_router(
         train_config,
         final_epoch,
         history[-1],
+        student_state_protocol,
     )
     with (output_dir / "summary.json").open("w", encoding="utf-8", newline="\n") as handle:
         json.dump(
@@ -296,6 +302,7 @@ def fit_router(
                 "final": history[-1],
                 "best_checkpoint": "best.pt",
                 "final_checkpoint": "final.pt",
+                "student_state_protocol": student_state_protocol,
             },
             handle,
             indent=2,

@@ -36,8 +36,14 @@ def test_evaluation_config_exposes_mass_and_optional_block_limit(tmp_path):
     assert config["evaluation"]["max_block"] == -1
     assert config["data"]["sequences"] == 290
     assert config["data"]["sequence_length"] == 4096
+    assert config["data"]["retrieval_local_context_length"] == 512
+    assert config["collection"]["local_context_length"] == 512
+    assert config["collection"]["block_size"] == 64
     assert config["collection"]["residual_layer"] == 40
     assert config["collection"]["teacher_layers"] == [29, 35, 41]
+    assert config["router"]["checkpoint"].endswith(
+        "block_probability_router_convomem_4096tokens_4096train_random_v1/training/best.pt"
+    )
     assert config["qa"]["enabled"] is True
     assert config["qa"]["maximum_samples"] is None
     assert config["qa"]["maximum_new_tokens"] == 64
@@ -97,7 +103,10 @@ def test_independent_pipeline_collects_then_evaluates_without_training(
 
     assert [stage for stage, _ in commands] == ["prepare", "collect", "evaluate"]
     assert commands[0][1][:2] == ["-m", "learnable_index.prepare_convomem"]
-    assert commands[1][1][:3] == ["-m", "learnable_index", "collect"]
+    assert commands[1][1][:2] == [
+        "-m",
+        "block_probability_router.streaming_collection",
+    ]
     assert "--no-store-kv-payload" in commands[1][1]
     evaluate = commands[2][1]
     assert evaluate[:3] == ["-m", "block_probability_router", "evaluate"]
@@ -130,7 +139,7 @@ def test_qa_stage_runs_autoregressive_evaluator_and_merges_summary(
         output.write_text(
             json.dumps(
                 {
-                    "qa_schema_version": 1,
+                    "qa_schema_version": 2,
                     "evaluation_kind": "greedy_autoregressive_long_context_qa",
                     "teacher_forcing": False,
                     "summary": {"sample_count": 290, "conditions": {}},

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from block_probability_router.cli import _evaluate
 from block_probability_router.config import (
     ProbabilityLossConfig,
     ProbabilityRouterConfig,
@@ -16,6 +18,7 @@ from block_probability_router.model import (
     BlockProbabilityRouter,
     minimum_cumulative_mass_mask,
 )
+from block_probability_router.streaming_collection import STUDENT_STATE_PROTOCOL
 from block_probability_router.trainer import evaluate_model, fit_router, load_checkpoint
 from learnable_index.data import RetrievalDataset, collate_retrieval_samples
 from learnable_index.planning import PlanConfig, SequenceRecord, build_retrieval_plans
@@ -165,6 +168,66 @@ def test_evaluation_reports_retrieval_cap_effects():
     assert metrics["missing_mass/0.02/oracle_cap_applied_rate"] > 0.0
 
 
+def test_evaluation_allows_legacy_checkpoint_and_reports_protocol_mismatch(
+    monkeypatch,
+):
+    dataset = RetrievalDataset(
+        make_synthetic_samples(
+            sample_count=2,
+            residual_dim=6,
+            min_blocks=2,
+            max_blocks=2,
+            seed=37,
+        )
+    )
+    train_config = ProbabilityTrainConfig(
+        epochs=1,
+        batch_size=2,
+        validation_fraction=0.0,
+        missing_mass_tolerances=(0.02,),
+        device="cpu",
+    )
+    monkeypatch.setattr(
+        "block_probability_router.cli.load_dataset",
+        lambda _path: (
+            dataset,
+            {"metadata": {"student_state_protocol": STUDENT_STATE_PROTOCOL}},
+        ),
+    )
+    monkeypatch.setattr(
+        "block_probability_router.cli.load_checkpoint",
+        lambda _path: (
+            _model(),
+            None,
+            ProbabilityLossConfig(),
+            train_config,
+            {"epoch": 3},
+        ),
+    )
+    monkeypatch.setattr(
+        "block_probability_router.cli.evaluate_model",
+        lambda *_args, **_kwargs: {"loss": 1.0},
+    )
+
+    result = _evaluate(
+        SimpleNamespace(
+            max_block=-1,
+            dataset_dir="dataset",
+            checkpoint="legacy.pt",
+            output=None,
+            device="cpu",
+            top_n=None,
+            missing_mass_tolerances=None,
+        )
+    )
+
+    assert result["student_state_protocol"] == {
+        "dataset": STUDENT_STATE_PROTOCOL,
+        "checkpoint": None,
+        "matched": False,
+    }
+
+
 def test_shared_plan_contract_excludes_current_visible_window_from_memory_candidates():
     record = SequenceRecord("sequence", tuple(range(800)), {})
     plans = build_retrieval_plans(
@@ -216,6 +279,7 @@ def test_small_training_run_writes_distinct_probability_router_checkpoint(tmp_pa
             missing_mass_tolerances=(0.02, 0.05),
             device="cpu",
         ),
+        student_state_protocol=STUDENT_STATE_PROTOCOL,
     )
 
     assert len(history) == 2
@@ -226,6 +290,7 @@ def test_small_training_run_writes_distinct_probability_router_checkpoint(tmp_pa
     assert train_config.missing_mass_tolerances == (0.02, 0.05)
     assert payload["format_version"] == 2
     assert payload["model_kind"] == "positive_block_probability_router"
+    assert payload["student_state_protocol"] == STUDENT_STATE_PROTOCOL
     run_config = json.loads((output_dir / "run_config.json").read_text(encoding="utf-8"))
     assert run_config["information_boundary"]["current_live_block_is_candidate"] is False
     assert run_config["normalization"] == "q_dot_sum_historical_key_features"

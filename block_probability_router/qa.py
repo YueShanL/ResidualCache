@@ -9,12 +9,12 @@ from pathlib import Path
 import random
 import re
 import time
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import torch
 
 from learnable_index.aligned_builder import load_collected_sequences
-from learnable_index.collectors import RestrictedStudentCollector, StudentCollectionConfig
+from learnable_index.collectors import StudentCollectionConfig
 from learnable_index.data import load_dataset
 from learnable_index.model_adapter import (
     build_rolling_local_mask,
@@ -29,10 +29,14 @@ from learnable_index.trainer import resolve_device
 from residual_cache.gemma4_memory_adapter import Gemma4StaticKVAdapter
 
 from .model import minimum_cumulative_mass_mask
+from .streaming_collection import (
+    STUDENT_STATE_PROTOCOL,
+    collect_streaming_student_state,
+)
 from .trainer import load_checkpoint
 
 
-QA_SCHEMA_VERSION = 1
+QA_SCHEMA_VERSION = 2
 
 
 def _epsilon_label(value: float) -> str:
@@ -204,11 +208,21 @@ def _generate_sparse_replay(
     initial_logical_position: int,
     historical_layer_kv: Mapping[int, tuple[torch.Tensor, torch.Tensor]],
     local_context_length: int,
+    block_size: int,
     maximum_new_tokens: int,
 ) -> GenerationResult:
     positions = tuple(int(value) for value in local_positions)
-    if len(positions) != local_context_length:
-        raise ValueError("initial local cache must fill the configured local window")
+    if local_context_length <= 0 or block_size <= 0:
+        raise ValueError("local context length and block size must be positive")
+    maximum_context_length = local_context_length + block_size
+    if not local_context_length <= len(positions) < maximum_context_length:
+        raise ValueError(
+            "initial block-aligned cache must lie in [local, local + block)"
+        )
+    if positions[0] % block_size:
+        raise ValueError("initial block-aligned cache must start on a block boundary")
+    if any(right != left + 1 for left, right in zip(positions, positions[1:])):
+        raise ValueError("initial local cache positions must be contiguous")
     if positions[-1] + 1 != initial_logical_position:
         raise ValueError("initial generation token must immediately follow the local cache")
     eos_token_id = bundle.tokenizer.eos_token_id
@@ -226,13 +240,11 @@ def _generate_sparse_replay(
     )
     with adapter:
         for _ in range(maximum_new_tokens):
-            cache = cache_suffix(cache, local_context_length - 1)
-            positions = positions[-(local_context_length - 1) :]
             mask = build_rolling_local_mask(
                 bundle,
                 past_positions=positions,
                 query_positions=(logical_position,),
-                local_context_length=local_context_length,
+                local_context_length=maximum_context_length,
             )
             output = forward_tokens(
                 bundle,
@@ -245,6 +257,11 @@ def _generate_sparse_replay(
             )
             cache = cache_from_layer_kv(layer_kv_from_cache(output.past_key_values))
             positions = positions + (logical_position,)
+            if len(positions) == maximum_context_length:
+                cache = cache_suffix(cache, local_context_length)
+                positions = positions[block_size:]
+            elif len(positions) > maximum_context_length:
+                raise RuntimeError("generation exceeded the block-aligned context bound")
             token_id = _next_token(output.logits[0, -1])
             generated.append(token_id)
             if eos_token_id is not None and token_id == int(eos_token_id):
@@ -280,11 +297,22 @@ def _evidence_only_prompt(record) -> tuple[int, ...]:
 
 
 @torch.inference_mode()
-def _router_selections(router, sample, config: QAEvaluationConfig, device: torch.device):
-    query = sample.query_summary.unsqueeze(0).to(device)
-    blocks = sample.block_summaries.unsqueeze(0).to(device)
+def _router_selections(
+    router,
+    query_summary: torch.Tensor,
+    block_summaries: torch.Tensor,
+    config: QAEvaluationConfig,
+    device: torch.device,
+):
+    # Streaming residuals inherit the frozen model dtype (normally bf16),
+    # whereas router checkpoints are stored and loaded in fp32.  Match the
+    # router parameter dtype explicitly so the real streaming QA path has the
+    # same numerical contract as offline evaluation over persisted fp32 data.
+    router_dtype = next(router.parameters()).dtype
+    query = query_summary.unsqueeze(0).to(device=device, dtype=router_dtype)
+    blocks = block_summaries.unsqueeze(0).to(device=device, dtype=router_dtype)
     candidate_mask = torch.ones(
-        (1, len(sample.candidate_blocks)), dtype=torch.bool, device=device
+        (1, block_summaries.shape[0]), dtype=torch.bool, device=device
     )
     output = router(query, blocks, candidate_mask)
     probabilities = output.probabilities[0].detach().float().cpu()
@@ -311,46 +339,6 @@ def _physical_full_attention_layers(bundle) -> tuple[int, ...]:
     if not layers:
         raise ValueError("Gemma configuration exposes no physical full-attention layers")
     return layers
-
-
-def _collect_selected_block_kv(
-    bundle,
-    record,
-    sample,
-    selected_indices: Iterable[int],
-    full_attention_layers: Sequence[int],
-    local_context_length: int,
-) -> dict[int, dict[int, tuple[torch.Tensor, torch.Tensor]]]:
-    """Materialize only selected full-attention block K/V and keep it on GPU."""
-
-    result: dict[int, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
-    for index in sorted(set(int(value) for value in selected_indices)):
-        block = sample.candidate_blocks[index]
-        context_end = block.end_position
-        context_start = max(0, context_end - local_context_length)
-        cache = new_full_dynamic_cache()
-        output = forward_tokens(
-            bundle,
-            record.token_ids[context_start:context_end],
-            range(context_start, context_end),
-            past_key_values=cache,
-            use_cache=True,
-        )
-        layer_kv = layer_kv_from_cache(output.past_key_values)
-        block_start = block.start_position - context_start
-        block_end = block.end_position - context_start
-        if block_start < 0:
-            raise RuntimeError("candidate block is larger than the local collection context")
-        result[index] = {
-            layer: (
-                layer_kv[layer][0][:, :, block_start:block_end, :].detach(),
-                layer_kv[layer][1][:, :, block_start:block_end, :].detach(),
-            )
-            for layer in full_attention_layers
-        }
-        if any(pair[0].shape[2] != block.length for pair in result[index].values()):
-            raise RuntimeError("selected block K/V slice has an invalid token length")
-    return result
 
 
 def _pack_selected_block_kv(
@@ -489,6 +477,25 @@ def _evidence_block_metrics(record, sample, selected_indices: Sequence[int]) -> 
     }
 
 
+def _verify_streaming_sample_alignment(sample, state) -> None:
+    """Reject collections whose router inputs were not captured by this stream."""
+
+    query = state.query_summary.detach().float().cpu()
+    blocks = state.block_summaries.detach().float().cpu()
+    if query.shape != sample.query_summary.shape or not torch.allclose(
+        query, sample.query_summary.float(), rtol=1e-4, atol=1e-4
+    ):
+        raise RuntimeError(
+            "stored query summary does not match block-aligned streaming replay"
+        )
+    if blocks.shape != sample.block_summaries.shape or not torch.allclose(
+        blocks, sample.block_summaries.float(), rtol=1e-4, atol=1e-4
+    ):
+        raise RuntimeError(
+            "stored block summaries do not match block-aligned streaming replay"
+        )
+
+
 def evaluate_generation_qa(
     *,
     collection_dir: str | Path,
@@ -519,14 +526,31 @@ def evaluate_generation_qa(
     )
     if dataset_manifest["metadata"]["model_fingerprint"] != bundle.fingerprint:
         raise ValueError("QA model fingerprint does not match the aligned collection")
-    student_config = StudentCollectionConfig(
-        **collection_manifest["collection_config"]["student"]
-    )
-    student = RestrictedStudentCollector(bundle, student_config)
+    if collection_manifest.get("student_state_protocol") != STUDENT_STATE_PROTOCOL:
+        raise ValueError(
+            "QA requires a block-aligned streaming probability-router collection"
+        )
+    if (
+        dataset_manifest.get("metadata", {}).get("student_state_protocol")
+        != STUDENT_STATE_PROTOCOL
+    ):
+        raise ValueError("dataset student-state protocol does not match QA replay")
+    collection_config = collection_manifest["collection_config"]
+    student_config = StudentCollectionConfig(**collection_config["student"])
+    block_size = int(collection_config["plan"]["block_size"])
+    if student_config.local_context_length % block_size:
+        raise ValueError("block-aligned local context must be divisible by block size")
+    native_sliding_window = int(bundle.text_config.sliding_window)
+    if student_config.local_context_length != native_sliding_window:
+        raise ValueError(
+            "probability-router replay local context must equal Gemma's native "
+            f"sliding window ({native_sliding_window})"
+        )
     full_attention_layers = _physical_full_attention_layers(bundle)
     router, router_config, _loss_config, _train_config, checkpoint = load_checkpoint(
         checkpoint_path
     )
+    checkpoint_protocol = checkpoint.get("student_state_protocol")
     if router_config.residual_dim != dataset.residual_dim:
         raise ValueError("router and aligned dataset residual dimensions do not match")
     router_device = resolve_device(config.router_device)
@@ -545,8 +569,21 @@ def evaluate_generation_qa(
             if sample.first_future_position_affected_by_retrieval != answer_start - 1:
                 raise ValueError("QA requires the answer-aligned retrieval schedule")
             reference = str(record.metadata["answer"])
+            streaming_state = collect_streaming_student_state(
+                bundle,
+                record,
+                sample,
+                student_config,
+                block_size=block_size,
+                capture_layers=full_attention_layers,
+            )
+            _verify_streaming_sample_alignment(sample, streaming_state)
             probabilities, selections = _router_selections(
-                router, sample, config, router_device
+                router,
+                streaming_state.query_summary,
+                streaming_state.block_summaries,
+                config,
+                router_device,
             )
             conditions: dict[str, dict[str, Any]] = {}
 
@@ -565,8 +602,8 @@ def evaluate_generation_qa(
             )
             conditions["evidence_only"] = _generation_metrics(reference, evidence_result)
 
-            local_layer_kv = student.collect_local_cache(record, sample)
-            local_positions = tuple(range(sample.local_context_start, sample.local_context_end))
+            local_layer_kv = streaming_state.local_layer_kv
+            local_positions = streaming_state.local_positions
             initial_position = sample.first_future_position_affected_by_retrieval
             initial_token = record.token_ids[initial_position]
             local_result = _generate_sparse_replay(
@@ -577,19 +614,12 @@ def evaluate_generation_qa(
                 initial_logical_position=initial_position,
                 historical_layer_kv={},
                 local_context_length=student_config.local_context_length,
+                block_size=block_size,
                 maximum_new_tokens=config.maximum_new_tokens,
             )
             conditions["local_only"] = _generation_metrics(reference, local_result)
 
-            union_indices = sorted({index for values in selections.values() for index in values})
-            block_kv = _collect_selected_block_kv(
-                bundle,
-                record,
-                sample,
-                union_indices,
-                full_attention_layers,
-                student_config.local_context_length,
-            )
+            block_kv = streaming_state.block_layer_kv
             candidate_count = len(sample.candidate_blocks)
             physical_count = bundle.physical_cache_layer_count
             prompt_length = answer_start
@@ -606,6 +636,7 @@ def evaluate_generation_qa(
                     initial_logical_position=initial_position,
                     historical_layer_kv=historical,
                     local_context_length=student_config.local_context_length,
+                    block_size=block_size,
                     maximum_new_tokens=config.maximum_new_tokens,
                 )
                 metric = _generation_metrics(reference, result)
@@ -615,7 +646,7 @@ def evaluate_generation_qa(
                 ) if indices else 0.0
                 selected_tokens = sum(sample.candidate_blocks[index].length for index in indices)
                 visible_layer_tokens = (
-                    student_config.local_context_length * physical_count
+                    len(local_positions) * physical_count
                     + selected_tokens * len(full_attention_layers)
                 )
                 metric.update(
@@ -645,6 +676,19 @@ def evaluate_generation_qa(
                 "evidence_distance_tokens": record.metadata.get(
                     "evidence_to_answer_distance_tokens"
                 ),
+                "streaming_state": {
+                    "protocol": STUDENT_STATE_PROTOCOL,
+                    "local_context_start": local_positions[0],
+                    "local_context_end": local_positions[-1] + 1,
+                    "local_context_length": len(local_positions),
+                    "forward_calls": streaming_state.forward_calls,
+                    "forwarded_tokens": streaming_state.forwarded_tokens,
+                    "evicted_blocks": streaming_state.evicted_blocks,
+                    "evicted_tokens": streaming_state.evicted_tokens,
+                    "maximum_forward_context_length": (
+                        streaming_state.maximum_forward_context_length
+                    ),
+                },
                 "conditions": conditions,
             }
             rows.append(row)
@@ -674,14 +718,28 @@ def evaluate_generation_qa(
         "teacher_forcing": False,
         "checkpoint": str(checkpoint_path),
         "checkpoint_epoch": int(checkpoint["epoch"]),
+        "student_state_protocol": {
+            "evaluation": STUDENT_STATE_PROTOCOL,
+            "checkpoint": checkpoint_protocol,
+            "matched": checkpoint_protocol == STUDENT_STATE_PROTOCOL,
+        },
         "model_fingerprint": bundle.fingerprint,
         "qa_config": asdict(config),
         "replay_semantics": {
-            "historical_unit": "complete_64_token_candidate_block",
+            "student_state_protocol": STUDENT_STATE_PROTOCOL,
+            "historical_unit": f"complete_{block_size}_token_candidate_block",
+            "block_capture": "single_causal_pass_at_atomic_block_eviction",
+            "router_inputs": "same_stream_query_and_completed_block_states",
             "selected_kv_layers": "physical_full_attention_only",
-            "sliding_attention_layers": "native_local_window_only",
+            "sliding_attention_layers": (
+                f"native_block_aligned_{student_config.local_context_length}_to_"
+                f"{student_config.local_context_length + block_size - 1}_token_window"
+            ),
             "logical_positions": "original_sequence_positions",
             "retrieval_time": "immediately_before_first_answer token prediction",
+            "generation_cache_policy": (
+                "grow_to_local_plus_block_then_atomically_evict_one_complete_block"
+            ),
         },
         "summary": _aggregate(rows, config),
     }

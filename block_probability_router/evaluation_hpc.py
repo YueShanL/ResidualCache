@@ -19,6 +19,8 @@ from learnable_index.hpc import (
     load_hpc_config,
 )
 
+from .streaming_collection import STUDENT_STATE_PROTOCOL
+
 
 OUTPUT_NAME = "metrics.json"
 QA_OUTPUT_NAME = "qa_metrics.json"
@@ -173,6 +175,8 @@ def validate_evaluation_hpc_config(config: dict[str, Any]) -> None:
         raise ValueError("collection and data local-context lengths must match")
     if int(collection["block_size"]) != int(data["placement_block_size"]):
         raise ValueError("collection block size must match evidence placement block size")
+    if int(collection["local_context_length"]) % int(collection["block_size"]):
+        raise ValueError("collection local context must be divisible by block size")
     if int(collection["future_horizon"]) > int(data["maximum_future_horizon"]):
         raise ValueError("collection future horizon exceeds synthesized maximum")
     teacher_prefill = collection.get("teacher_prefill_chunk_size")
@@ -407,17 +411,19 @@ class EvaluationHPCPipeline:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             expected = int(self.config["data"]["sequences"])
             if (
-                int(manifest.get("sequence_count", -1)) != expected
+                manifest.get("student_state_protocol") != STUDENT_STATE_PROTOCOL
+                or int(manifest.get("sequence_count", -1)) != expected
                 or int(manifest.get("sample_count", -1)) != expected
             ):
-                raise RuntimeError(f"collection manifest mismatch: {manifest_path}")
+                raise RuntimeError(
+                    f"streaming collection manifest mismatch: {manifest_path}"
+                )
             self._emit("stage_skip", stage="collect", reason="complete")
             return
         collection = self.config["collection"]
         arguments = [
             "-m",
-            "learnable_index",
-            "collect",
+            "block_probability_router.streaming_collection",
             "--model-name",
             str(self.config["model"]["name"]),
             "--model-device",

@@ -9,6 +9,7 @@ from learnable_index.data import load_dataset
 from learnable_index.trainer import resolve_device
 
 from .config import ProbabilityLossConfig, ProbabilityRouterConfig, ProbabilityTrainConfig
+from .streaming_collection import STUDENT_STATE_PROTOCOL
 from .trainer import evaluate_model, fit_router, load_checkpoint
 
 
@@ -73,6 +74,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _train(arguments: argparse.Namespace) -> dict:
     dataset, manifest = load_dataset(arguments.dataset_dir)
+    dataset_protocol = manifest.get("metadata", {}).get("student_state_protocol")
+    if dataset_protocol != STUDENT_STATE_PROTOCOL:
+        raise ValueError(
+            "probability-router training requires the block-aligned streaming dataset protocol"
+        )
     router_config = ProbabilityRouterConfig(
         residual_dim=dataset.residual_dim,
         feature_dim=arguments.feature_dim,
@@ -102,6 +108,7 @@ def _train(arguments: argparse.Namespace) -> dict:
         router_config,
         ProbabilityLossConfig(),
         train_config,
+        student_state_protocol=dataset_protocol,
     )
     return {
         "output_dir": str(arguments.output_dir),
@@ -114,8 +121,14 @@ def _train(arguments: argparse.Namespace) -> dict:
 def _evaluate(arguments: argparse.Namespace) -> dict:
     if arguments.max_block != -1 and arguments.max_block <= 0:
         raise ValueError("max_block must be -1 or a positive integer")
-    dataset, _ = load_dataset(arguments.dataset_dir)
+    dataset, manifest = load_dataset(arguments.dataset_dir)
+    dataset_protocol = manifest.get("metadata", {}).get("student_state_protocol")
+    if dataset_protocol != STUDENT_STATE_PROTOCOL:
+        raise ValueError(
+            "probability-router evaluation requires the block-aligned streaming dataset protocol"
+        )
     model, _, loss_config, stored_config, payload = load_checkpoint(arguments.checkpoint)
+    checkpoint_protocol = payload.get("student_state_protocol")
     train_config = replace(
         stored_config,
         device=arguments.device,
@@ -137,6 +150,11 @@ def _evaluate(arguments: argparse.Namespace) -> dict:
     result = {
         "checkpoint": str(arguments.checkpoint),
         "checkpoint_epoch": payload["epoch"],
+        "student_state_protocol": {
+            "dataset": dataset_protocol,
+            "checkpoint": checkpoint_protocol,
+            "matched": checkpoint_protocol == dataset_protocol,
+        },
         "sample_count": len(dataset),
         "retrieval_policy": {
             "kind": "minimum_cumulative_probability_mass",

@@ -4,16 +4,20 @@ This package trains an independent, positive two-tower router from the aligned
 datasets produced by `learnable_index`.  It does not add a mode switch to the
 legacy cosine-logit router.
 
-For retrieval point `t`, the frozen Gemma collector supplies:
+For retrieval point `t`, the frozen Gemma collector supplies these states from
+one causal, block-aligned streaming pass:
 
 - `q_t`: layer-40 summary of the currently visible restricted history;
 - `k_b`: layer-40 summary of each completed historical block `b`;
 - `p_teacher(b | M_t)`: mean next-block teacher attention mass, normalized only
   across eligible historical memory blocks `M_t`.
 
-The live block that contains `q_t` is not part of `M_t`.  Candidate construction
-already enforces `block.end_position <= local_context_start`, so neither the
-model nor the loss contains a fallback that masks a leaked current block.
+The live block that contains `q_t` is not part of `M_t`. Complete 64-token
+blocks are captured only when atomically evicted. The native local cache is
+allowed to grow from 512 to 575 tokens; reaching 576 unloads one complete block
+and returns it to 512. Candidate construction enforces
+`block.end_position <= local_context_start`, so neither the model nor the loss
+contains a fallback that masks a leaked current block.
 
 The trained model computes
 
@@ -81,13 +85,30 @@ QA without teacher forcing under these conditions:
 - `router_epsilon_<epsilon>`: the same local window augmented with the blocks
   selected by each cumulative missing-mass tolerance.
 
-Router-selected block K/V retains the original logical positions and augments
-only physical full-attention layers. Sliding-attention layers keep their native
-local window. The report includes exact match, token F1, answer containment,
+Router-selected block K/V is captured by the same streaming pass at block
+eviction, retains the original logical positions, and augments only physical
+full-attention layers. The final query, candidate block summaries, and native
+local cache all come from that same pass; no window or selected block is
+recomputed after retrieval. Sliding-attention layers keep the native
+block-aligned 512-to-575-token local window during autoregressive generation.
+New training records this student-state protocol in the checkpoint. Evaluation
+also accepts legacy checkpoints so their compatibility can be measured, while
+reporting the checkpoint and evaluation protocols and whether they match.
+The report includes exact match, token F1, answer containment,
 95% bootstrap intervals, paired deltas against all three baselines, evidence
 block recall, retained teacher/predicted mass, selected-block fraction, and a
 visible layer-token KV ratio. This is an answer-generation test; the gold
 answer is never fed back during decoding.
+
+`oracle_replay_smoke` isolates replay from both the learned router and memory.
+It synthesizes four 4096-token ConvoMem examples, obtains the full-context
+teacher block distribution, selects the smallest block set retaining
+`1 - epsilon` historical teacher mass, and autoregressively compares the
+resulting KV replay with full-context generation. Replay K/V is sliced directly
+from a full-context source cache, eliminating router-state or streaming-ingest
+differences. An all-historical replay control must exactly match full-context
+generated tokens before compressed replay quality is interpreted. Only JSON
+metrics are saved; synthesized examples and KV payloads remain transient.
 
 The independent evaluation config accepts either one number or a sorted list in
 `evaluation.epsilon`. `evaluation.max_block` is applied after cumulative-mass

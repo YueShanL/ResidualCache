@@ -5,7 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
-from typing import Any
+from typing import Any, Iterable
 
 from learnable_index.hpc import (
     EXPORTED_TRAINING_ARTIFACTS,
@@ -18,6 +18,8 @@ from learnable_index.hpc import (
     load_hpc_config,
     validate_hpc_config as validate_collection_hpc_config,
 )
+
+from .streaming_collection import STUDENT_STATE_PROTOCOL
 
 
 EXPORTED_EVALUATION_ARTIFACTS = ("validation.json", "test.json")
@@ -48,6 +50,18 @@ def validate_hpc_config(config: dict[str, Any]) -> None:
         raise ValueError("router.positive_floor must be positive")
     if float(router.get("normalization_epsilon", 1e-12)) <= 0:
         raise ValueError("router.normalization_epsilon must be positive")
+    local_context_length = int(config["collection"]["local_context_length"])
+    block_size = int(config["collection"]["block_size"])
+    if local_context_length % block_size:
+        raise ValueError(
+            "probability-router local context must be divisible by block size"
+        )
+    for split, split_config in config["data"]["splits"].items():
+        if bool(split_config.get("store_kv_payload", True)):
+            raise ValueError(
+                "probability-router streaming collection does not persist KV payloads; "
+                f"set data.splits.{split}.store_kv_payload=false"
+            )
     tolerances = tuple(
         float(value) for value in config["training"]["missing_mass_tolerances"]
     )
@@ -101,6 +115,45 @@ class HPCPipeline(AlignedCollectionHPCPipeline):
                 raise RuntimeError(f"output root belongs to a different config: {self.output_root}")
         else:
             path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def collect(self, splits: Iterable[str] = REQUIRED_SPLITS) -> None:
+        """Collect labels and router inputs with the dedicated streaming student."""
+
+        if not self._enabled("collect"):
+            return
+        for split in splits:
+            output = self._collection_dir(split)
+            manifest_path = output / "collection_manifest.json"
+            if manifest_path.exists():
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                expected_sequences = int(
+                    self.config["data"]["splits"][split]["sequences"]
+                )
+                if (
+                    manifest.get("student_state_protocol")
+                    != STUDENT_STATE_PROTOCOL
+                    or int(manifest.get("sequence_count", -1)) != expected_sequences
+                    or int(manifest.get("sample_count", -1))
+                    != self._expected_samples(split)
+                ):
+                    raise RuntimeError(f"streaming collection manifest mismatch: {manifest_path}")
+                self._emit("stage_skip", stage=f"collect:{split}", reason="complete")
+                continue
+            if not self._input_path(split).exists():
+                raise FileNotFoundError(f"prepared input is missing for split={split}")
+            self._run_command(
+                f"collect:{split}",
+                [
+                    "-m",
+                    "block_probability_router.streaming_collection",
+                    *self._model_arguments(),
+                    "--input-jsonl",
+                    str(self._input_path(split)),
+                    "--output-dir",
+                    str(output),
+                    *self._collection_arguments(split),
+                ],
+            )
 
     def train(self) -> None:
         if not self._enabled("train"):

@@ -27,6 +27,7 @@ def test_example_config_preserves_frozen_model_collection_controls(tmp_path):
     assert config["collection"]["residual_layer"] == 40
     assert config["collection"]["teacher_layers"] == [29, 35, 41]
     assert config["collection"]["block_size"] == 64
+    assert config["collection"]["local_context_length"] == 512
     assert config["collection"]["future_horizon"] == 64
     assert config["data"]["maximum_future_horizon"] == 64
     assert config["data"]["evidence_placement"] == "stratified_random"
@@ -50,12 +51,15 @@ def test_hpc_train_and_evaluation_use_independent_module_entry(tmp_path, monkeyp
     train = commands[0][1]
     assert train[:3] == ["-m", "block_probability_router", "train"]
     assert "--temperature" not in train
-    assert train[train.index("--missing-mass-tolerances") + 1] == "0.01,0.02,0.05,0.1"
+    assert (
+        train[train.index("--missing-mass-tolerances") + 1]
+        == "0.01,0.02,0.05,0.1,0.5"
+    )
     assert [stage for stage, _ in commands[1:]] == ["evaluate:validation", "evaluate:test"]
     assert all(command[:3] == ["-m", "block_probability_router", "evaluate"] for _, command in commands[1:])
 
 
-def test_shared_collection_command_remains_legacy_data_producer(tmp_path, monkeypatch):
+def test_collection_uses_dedicated_block_streaming_entry(tmp_path, monkeypatch):
     pipeline = HPCPipeline(_config(tmp_path))
     input_path = pipeline._input_path("train")
     input_path.parent.mkdir(parents=True, exist_ok=True)
@@ -70,5 +74,8 @@ def test_shared_collection_command_remains_legacy_data_producer(tmp_path, monkey
     pipeline.collect(("train",))
 
     assert commands[0][0] == "collect:train"
-    assert commands[0][1][:3] == ["-m", "learnable_index", "collect"]
+    assert commands[0][1][:2] == [
+        "-m",
+        "block_probability_router.streaming_collection",
+    ]
     assert commands[0][1][commands[0][1].index("--residual-layer") + 1] == "40"
