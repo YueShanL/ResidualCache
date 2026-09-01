@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "run_id": "output_preserving_region_router_convomem4096_4096train_full_v1",
+  "seed": 13,
+  "paths": {
+    "output_root": "outputs/output_preserving_region_router_convomem4096_4096train_full_v1",
+    "use_tmp_workspace": true,
+    "tmp_workspace_root": "/tmp"
+  },
+  "model": {
+    "name": "google/gemma-4-E4B-it",
+    "device": "cuda",
+    "dtype": "bfloat16",
+    "allow_network": true
+  },
+  "data": {
+    "source": "convomem",
+    "dataset_name": "Salesforce/ConvoMem",
+    "cache_dir": null,
+    "allow_network": true,
+    "sequence_length": 4096,
+    "maximum_answer_tokens": 64,
+    "maximum_future_horizon": 64,
+    "evidence_placement": "stratified_random",
+    "evidence_placement_bins": 4,
+    "placement_block_size": 64,
+    "retrieval_local_context_length": 512,
+    "sampling_seed": 97,
+    "persist_prepared_inputs": false,
+    "splits": {
+      "train": {
+        "sequences": 4096,
+        "store_kv_payload": false
+      },
+      "validation": {
+        "sequences": 295,
+        "store_kv_payload": false
+      },
+      "test": {
+        "sequences": 290,
+        "store_kv_payload": false
+      }
+    }
+  },
+  "collection": {
+    "local_context_length": 512,
+    "block_size": 64,
+    "future_horizon": 64,
+    "retrieval_interval": 128,
+    "retrieval_point_policy": "metadata",
+    "minimum_candidate_blocks": 2,
+    "maximum_candidate_blocks": null,
+    "residual_layer": 40,
+    "query_summary": "mean",
+    "query_summary_length": 16,
+    "progress_every": 25
+  },
+  "router": {
+    "feature_dim": 128,
+    "hidden_dim": 256,
+    "depth": 2,
+    "dropout": 0.1,
+    "minimum_scale": 0.05,
+    "radius": 1.0,
+    "gate_temperature": 0.25,
+    "gate_epsilon": 0.000001
+  },
+  "objective": {
+    "output_temperature": 1.0,
+    "maximum_excess_output_kl": 0.02,
+    "preservation_weight": 100.0,
+    "sparsity_weight": 1.0,
+    "gate_entropy_weight": 0.01
+  },
+  "training": {
+    "epochs": 10,
+    "early_stopping_patience": 2,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.0001,
+    "gradient_accumulation_steps": 4,
+    "gradient_clip_norm": 1.0,
+    "validation_fraction": 0.1,
+    "device": "cuda",
+    "prefill_chunk_size": 256,
+    "final_gate_temperature": 0.05,
+    "maximum_train_samples": null,
+    "maximum_validation_samples": null,
+    "progress_every": 25
+  },
+  "evaluation": {
+    "device": "cuda",
+    "maximum_samples": null,
+    "qa_enabled": true,
+    "qa_maximum_samples": null,
+    "maximum_new_tokens": 64,
+    "prefill_chunk_size": 256,
+    "progress_every": 25
+  },
+  "replay": {"enabled": false},
+  "stages": {"prepare": true, "train": true, "evaluate": true}
+}

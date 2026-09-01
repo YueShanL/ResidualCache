@@ -23,6 +23,14 @@ def _config(tmp_path):
     return config
 
 
+def _full_config():
+    return load_hpc_config(
+        PROJECT_ROOT
+        / "configs"
+        / "output_preserving_region_router_convomem4096_full_hpc.json"
+    )
+
+
 def test_example_config_is_one_region_output_preservation_smoke(tmp_path):
     config = _config(tmp_path)
     validate_hpc_config(config)
@@ -36,6 +44,21 @@ def test_example_config_is_one_region_output_preservation_smoke(tmp_path):
     assert config["collection"]["maximum_candidate_blocks"] is None
     assert "teacher_layers" not in config["collection"]
     assert config["data"]["persist_prepared_inputs"] is False
+
+
+def test_full_config_preserves_system_and_uses_official_scale():
+    config = _full_config()
+    validate_hpc_config(config)
+
+    assert config["data"]["splits"]["train"]["sequences"] == 4096
+    assert config["data"]["splits"]["validation"]["sequences"] == 295
+    assert config["data"]["splits"]["test"]["sequences"] == 290
+    assert config["training"]["epochs"] == 10
+    assert config["training"]["early_stopping_patience"] == 2
+    assert config["training"]["validation_fraction"] == 0.1
+    assert config["collection"]["maximum_candidate_blocks"] is None
+    assert config["evaluation"]["maximum_samples"] is None
+    assert config["evaluation"]["qa_maximum_samples"] is None
 
 
 def test_hpc_train_and_hard_evaluation_use_independent_entry(tmp_path, monkeypatch):

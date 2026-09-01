@@ -95,3 +95,14 @@ python -u scripts/run_output_preserving_region_router_hpc.py \
   --config configs/output_preserving_region_router_convomem4096_smoke_hpc.json \
   --validate-only
 ```
+
+After the smoke run validates memory use and the loss trajectory, the full
+configuration keeps the same architecture, optimizer, regularization, and
+4096-token synthesis policy while expanding to 4096 training, 295 official
+validation, and 290 official test examples. It uses an internal 10% split,
+up to 10 epochs, and early-stopping patience 2:
+
+```bash
+python -u scripts/run_output_preserving_region_router_hpc.py \
+  --config configs/output_preserving_region_router_convomem4096_full_hpc.json
+```
