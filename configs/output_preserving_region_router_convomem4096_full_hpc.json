@@ -16,7 +16,7 @@
   "data": {
     "source": "convomem",
     "dataset_name": "Salesforce/ConvoMem",
-    "cache_dir": null,
+    "cache_dir": "/data/gpfs/projects/punim2072/LoRA_ICL_Analysis/LLM_LoRA_ICL_Analysis/.cache/huggingface/hub",
     "allow_network": true,
     "sequence_length": 4096,
     "maximum_answer_tokens": 64,
