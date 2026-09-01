@@ -28,15 +28,16 @@ from learnable_index.model_adapter import (
 from learnable_index.trainer import resolve_device
 from residual_cache.gemma4_memory_adapter import Gemma4StaticKVAdapter
 
-from .model import minimum_cumulative_mass_mask
-from .streaming_collection import (
-    STUDENT_STATE_PROTOCOL,
-    collect_streaming_student_state,
+from .full_context_replay import (
+    FULL_CONTEXT_REPLAY_SOURCE_PROTOCOL,
+    collect_full_context_replay_state,
 )
+from .model import minimum_cumulative_mass_mask
+from .streaming_collection import STUDENT_STATE_PROTOCOL
 from .trainer import load_checkpoint
 
 
-QA_SCHEMA_VERSION = 2
+QA_SCHEMA_VERSION = 3
 
 
 def _epsilon_label(value: float) -> str:
@@ -477,25 +478,6 @@ def _evidence_block_metrics(record, sample, selected_indices: Sequence[int]) -> 
     }
 
 
-def _verify_streaming_sample_alignment(sample, state) -> None:
-    """Reject collections whose router inputs were not captured by this stream."""
-
-    query = state.query_summary.detach().float().cpu()
-    blocks = state.block_summaries.detach().float().cpu()
-    if query.shape != sample.query_summary.shape or not torch.allclose(
-        query, sample.query_summary.float(), rtol=1e-4, atol=1e-4
-    ):
-        raise RuntimeError(
-            "stored query summary does not match block-aligned streaming replay"
-        )
-    if blocks.shape != sample.block_summaries.shape or not torch.allclose(
-        blocks, sample.block_summaries.float(), rtol=1e-4, atol=1e-4
-    ):
-        raise RuntimeError(
-            "stored block summaries do not match block-aligned streaming replay"
-        )
-
-
 def evaluate_generation_qa(
     *,
     collection_dir: str | Path,
@@ -569,19 +551,19 @@ def evaluate_generation_qa(
             if sample.first_future_position_affected_by_retrieval != answer_start - 1:
                 raise ValueError("QA requires the answer-aligned retrieval schedule")
             reference = str(record.metadata["answer"])
-            streaming_state = collect_streaming_student_state(
+            replay_state = collect_full_context_replay_state(
                 bundle,
                 record,
                 sample,
                 student_config,
                 block_size=block_size,
+                prefill_chunk_size=config.prefill_chunk_size,
                 capture_layers=full_attention_layers,
             )
-            _verify_streaming_sample_alignment(sample, streaming_state)
             probabilities, selections = _router_selections(
                 router,
-                streaming_state.query_summary,
-                streaming_state.block_summaries,
+                replay_state.query_summary,
+                replay_state.block_summaries,
                 config,
                 router_device,
             )
@@ -602,8 +584,8 @@ def evaluate_generation_qa(
             )
             conditions["evidence_only"] = _generation_metrics(reference, evidence_result)
 
-            local_layer_kv = streaming_state.local_layer_kv
-            local_positions = streaming_state.local_positions
+            local_layer_kv = replay_state.local_layer_kv
+            local_positions = replay_state.local_positions
             initial_position = sample.first_future_position_affected_by_retrieval
             initial_token = record.token_ids[initial_position]
             local_result = _generate_sparse_replay(
@@ -619,7 +601,7 @@ def evaluate_generation_qa(
             )
             conditions["local_only"] = _generation_metrics(reference, local_result)
 
-            block_kv = streaming_state.block_layer_kv
+            block_kv = replay_state.block_layer_kv
             candidate_count = len(sample.candidate_blocks)
             physical_count = bundle.physical_cache_layer_count
             prompt_length = answer_start
@@ -676,18 +658,13 @@ def evaluate_generation_qa(
                 "evidence_distance_tokens": record.metadata.get(
                     "evidence_to_answer_distance_tokens"
                 ),
-                "streaming_state": {
-                    "protocol": STUDENT_STATE_PROTOCOL,
+                "replay_source_state": {
+                    "protocol": FULL_CONTEXT_REPLAY_SOURCE_PROTOCOL,
                     "local_context_start": local_positions[0],
                     "local_context_end": local_positions[-1] + 1,
                     "local_context_length": len(local_positions),
-                    "forward_calls": streaming_state.forward_calls,
-                    "forwarded_tokens": streaming_state.forwarded_tokens,
-                    "evicted_blocks": streaming_state.evicted_blocks,
-                    "evicted_tokens": streaming_state.evicted_tokens,
-                    "maximum_forward_context_length": (
-                        streaming_state.maximum_forward_context_length
-                    ),
+                    "forward_calls": replay_state.forward_calls,
+                    "forwarded_tokens": replay_state.forwarded_tokens,
                 },
                 "conditions": conditions,
             }
@@ -719,24 +696,29 @@ def evaluate_generation_qa(
         "checkpoint": str(checkpoint_path),
         "checkpoint_epoch": int(checkpoint["epoch"]),
         "student_state_protocol": {
-            "evaluation": STUDENT_STATE_PROTOCOL,
+            "evaluation": FULL_CONTEXT_REPLAY_SOURCE_PROTOCOL,
             "checkpoint": checkpoint_protocol,
-            "matched": checkpoint_protocol == STUDENT_STATE_PROTOCOL,
+            "matched": checkpoint_protocol == FULL_CONTEXT_REPLAY_SOURCE_PROTOCOL,
+            "collection": STUDENT_STATE_PROTOCOL,
         },
         "model_fingerprint": bundle.fingerprint,
         "qa_config": asdict(config),
         "replay_semantics": {
-            "student_state_protocol": STUDENT_STATE_PROTOCOL,
+            "replay_source_protocol": FULL_CONTEXT_REPLAY_SOURCE_PROTOCOL,
+            "pre_retrieval_history": "full_context_through_retrieval_position",
+            "cut_operation": (
+                "one_atomic_posthoc_partition_into_historical_blocks_and_local_suffix"
+            ),
             "historical_unit": f"complete_{block_size}_token_candidate_block",
-            "block_capture": "single_causal_pass_at_atomic_block_eviction",
-            "router_inputs": "same_stream_query_and_completed_block_states",
+            "block_capture": "posthoc_slice_from_one_full_context_prefix_cache",
+            "router_inputs": "same_full_context_prefix_query_and_block_states",
             "selected_kv_layers": "physical_full_attention_only",
             "sliding_attention_layers": (
                 f"native_block_aligned_{student_config.local_context_length}_to_"
                 f"{student_config.local_context_length + block_size - 1}_token_window"
             ),
             "logical_positions": "original_sequence_positions",
-            "retrieval_time": "immediately_before_first_answer token prediction",
+            "retrieval_time": "one_posthoc_cut_at_the_fixed_answer_retrieval_point",
             "generation_cache_policy": (
                 "grow_to_local_plus_block_then_atomically_evict_one_complete_block"
             ),

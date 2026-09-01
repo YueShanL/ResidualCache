@@ -10,15 +10,9 @@ from typing import Any, Sequence
 
 import torch
 
-from learnable_index.collectors import TeacherAttentionCollector
+from learnable_index.collectors import StudentCollectionConfig, TeacherAttentionCollector
 from learnable_index.config import AttentionAggregationConfig
-from learnable_index.model_adapter import (
-    cache_from_layer_kv,
-    forward_tokens,
-    layer_kv_from_cache,
-    load_frozen_gemma,
-    new_full_dynamic_cache,
-)
+from learnable_index.model_adapter import load_frozen_gemma
 from learnable_index.planning import (
     PlanConfig,
     SequenceRecord,
@@ -30,6 +24,10 @@ from learnable_index.prepare_convomem import (
 )
 
 from .model import minimum_cumulative_mass_mask
+from .full_context_replay import (
+    FULL_CONTEXT_REPLAY_SOURCE_PROTOCOL,
+    collect_full_context_replay_state,
+)
 from .qa import (
     _generate_full_context,
     _generate_sparse_replay,
@@ -40,16 +38,6 @@ from .qa import (
     token_f1,
 )
 SMOKE_SCHEMA_VERSION = 1
-FULL_CONTEXT_REPLAY_SOURCE_PROTOCOL = "full_context_kv_sliced_posthoc_v1"
-
-
-@dataclass(frozen=True)
-class FullContextReplayState:
-    block_layer_kv: dict[int, dict[int, tuple[torch.Tensor, torch.Tensor]]]
-    local_layer_kv: tuple[tuple[torch.Tensor, torch.Tensor], ...]
-    local_positions: tuple[int, ...]
-    forward_calls: int
-    forwarded_tokens: int
 
 
 @dataclass(frozen=True)
@@ -64,6 +52,9 @@ class OracleReplaySmokeConfig:
     teacher_prefill_chunk_size: int = 256
     generation_prefill_chunk_size: int = 256
     teacher_layers: tuple[int, ...] = (29, 35, 41)
+    residual_layer: int = 40
+    query_summary: str = "mean"
+    query_summary_length: int = 16
     missing_mass_tolerance: float = 0.02
     seed: int = 13
     sampling_seed: int = 197
@@ -79,6 +70,7 @@ class OracleReplaySmokeConfig:
             self.maximum_new_tokens,
             self.teacher_prefill_chunk_size,
             self.generation_prefill_chunk_size,
+            self.query_summary_length,
         )
         if min(positive) <= 0:
             raise ValueError("oracle replay smoke sizes must be positive")
@@ -88,6 +80,8 @@ class OracleReplaySmokeConfig:
             raise ValueError("missing mass tolerance must be in (0, 1)")
         if not self.teacher_layers or min(self.teacher_layers) < 0:
             raise ValueError("teacher layers must be non-empty and non-negative")
+        if self.query_summary not in {"last", "mean"}:
+            raise ValueError("query_summary must be 'last' or 'mean'")
 
 
 def select_teacher_oracle_blocks(
@@ -110,81 +104,6 @@ def select_teacher_oracle_blocks(
         -1,
     )[0]
     return tuple(index for index, selected in enumerate(mask.tolist()) if selected)
-
-
-@torch.inference_mode()
-def collect_full_context_replay_state(
-    bundle,
-    record: SequenceRecord,
-    plan,
-    *,
-    local_context_length: int,
-    block_size: int,
-    prefill_chunk_size: int,
-    capture_layers: Sequence[int],
-) -> FullContextReplayState:
-    """Slice replay K/V from one full-context cache without recomputation."""
-
-    if local_context_length % block_size:
-        raise ValueError("local context length must be divisible by block size")
-    local_start = (int(plan.local_context_start) // block_size) * block_size
-    local_end = int(plan.local_context_end)
-    local_length = local_end - local_start
-    if not local_context_length <= local_length < local_context_length + block_size:
-        raise RuntimeError("full-context replay local slice is outside block-aligned bounds")
-    if tuple(range(local_start, local_end))[-1] + 1 != plan.future_start:
-        raise RuntimeError("full-context replay cache does not end before the query token")
-    if any(block.end_position > local_start for block in plan.candidate_blocks):
-        raise RuntimeError("historical candidate overlaps the block-aligned local slice")
-
-    cache = new_full_dynamic_cache()
-    forward_calls = 0
-    for start in range(0, local_end, prefill_chunk_size):
-        end = min(start + prefill_chunk_size, local_end)
-        output = forward_tokens(
-            bundle,
-            record.token_ids[start:end],
-            range(start, end),
-            past_key_values=cache,
-            use_cache=True,
-            logical_cache_position=True,
-        )
-        cache = cache_from_layer_kv(layer_kv_from_cache(output.past_key_values))
-        forward_calls += 1
-    pairs = layer_kv_from_cache(cache)
-    if any(int(key.shape[2]) != local_end for key, _value in pairs):
-        raise RuntimeError("full-context replay source cache has an invalid length")
-    layers = tuple(sorted({int(layer) for layer in capture_layers}))
-    if not layers or layers[-1] >= len(pairs):
-        raise IndexError("full-context replay capture layer is outside the cache")
-    block_layer_kv = {
-        index: {
-            layer: (
-                pairs[layer][0][
-                    :, :, block.start_position : block.end_position, :
-                ].detach(),
-                pairs[layer][1][
-                    :, :, block.start_position : block.end_position, :
-                ].detach(),
-            )
-            for layer in layers
-        }
-        for index, block in enumerate(plan.candidate_blocks)
-    }
-    local_layer_kv = tuple(
-        (
-            key[:, :, local_start:local_end, :].detach(),
-            value[:, :, local_start:local_end, :].detach(),
-        )
-        for key, value in pairs
-    )
-    return FullContextReplayState(
-        block_layer_kv=block_layer_kv,
-        local_layer_kv=local_layer_kv,
-        local_positions=tuple(range(local_start, local_end)),
-        forward_calls=forward_calls,
-        forwarded_tokens=local_end,
-    )
 
 
 def _sequence_record(row: dict[str, Any]) -> SequenceRecord:
@@ -393,7 +312,12 @@ def run_oracle_replay_smoke(
                 bundle,
                 record,
                 plan,
-                local_context_length=config.local_context_length,
+                StudentCollectionConfig(
+                    local_context_length=config.local_context_length,
+                    residual_layer=config.residual_layer,
+                    query_summary=config.query_summary,
+                    query_summary_length=config.query_summary_length,
+                ),
                 block_size=config.block_size,
                 prefill_chunk_size=config.generation_prefill_chunk_size,
                 capture_layers=full_attention_layers,

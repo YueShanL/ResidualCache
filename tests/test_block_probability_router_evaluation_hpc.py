@@ -139,7 +139,7 @@ def test_qa_stage_runs_autoregressive_evaluator_and_merges_summary(
         output.write_text(
             json.dumps(
                 {
-                    "qa_schema_version": 2,
+                    "qa_schema_version": 3,
                     "evaluation_kind": "greedy_autoregressive_long_context_qa",
                     "teacher_forcing": False,
                     "summary": {"sample_count": 290, "conditions": {}},

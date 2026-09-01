@@ -8,6 +8,10 @@ import torch
 from block_probability_router.oracle_replay_smoke import (
     select_teacher_oracle_blocks,
 )
+from block_probability_router.full_context_replay import (
+    FULL_CONTEXT_REPLAY_SOURCE_PROTOCOL,
+    collect_full_context_replay_state,
+)
 from block_probability_router.qa import (
     QAEvaluationConfig,
     _aggregate,
@@ -264,6 +268,95 @@ def test_streaming_state_comes_from_one_block_aligned_collector(monkeypatch):
     assert state.local_positions == (6, 7, 8, 9)
     assert sorted(state.block_layer_kv) == [0, 1, 2]
     assert state.block_layer_kv[2][0][0].flatten().tolist() == [4.0, 5.0]
+
+
+def test_full_context_replay_state_is_cut_from_one_shared_prefix(monkeypatch):
+    observed = []
+
+    def fake_forward(
+        _bundle,
+        token_ids,
+        logical_positions,
+        *,
+        past_key_values,
+        use_cache,
+        output_hidden_states,
+        logical_cache_position,
+        **_kwargs,
+    ):
+        assert use_cache and output_hidden_states and logical_cache_position
+        positions = tuple(logical_positions)
+        past = past_key_values[0][0]
+        observed.append((positions, int(past.shape[2])))
+        current = torch.tensor(positions, dtype=torch.float32).view(1, 1, -1, 1)
+        key = torch.cat((past, current), dim=2)
+        return SimpleNamespace(
+            past_key_values=((key, key + 100.0),),
+            selected_hidden=current[:, 0, :, :],
+        )
+
+    empty = torch.empty((1, 1, 0, 1), dtype=torch.float32)
+    monkeypatch.setattr(
+        "block_probability_router.full_context_replay.new_full_dynamic_cache",
+        lambda: ((empty, empty),),
+    )
+    monkeypatch.setattr(
+        "block_probability_router.full_context_replay.forward_tokens", fake_forward
+    )
+    monkeypatch.setattr(
+        "block_probability_router.full_context_replay.cache_from_layer_kv", tuple
+    )
+    monkeypatch.setattr(
+        "block_probability_router.full_context_replay.layer_kv_from_cache", tuple
+    )
+    monkeypatch.setattr(
+        "block_probability_router.full_context_replay.hidden_state_at_layer",
+        lambda output, _layer: output.selected_hidden,
+    )
+    candidates = tuple(
+        BlockRange(f"s:block:{start:09d}-{start + 2:09d}", start, start + 2)
+        for start in (0, 2, 4)
+    )
+    plan = RetrievalPlan(
+        sample_id="sample",
+        sequence_id="s",
+        retrieval_position=9,
+        first_future_position_affected_by_retrieval=10,
+        future_horizon_length=1,
+        local_context_start=6,
+        local_context_end=10,
+        candidate_blocks=candidates,
+    )
+
+    state = collect_full_context_replay_state(
+        SimpleNamespace(),
+        SequenceRecord("s", tuple(range(12)), {}),
+        plan,
+        StudentCollectionConfig(
+            local_context_length=4,
+            residual_layer=0,
+            query_summary="mean",
+            query_summary_length=2,
+        ),
+        block_size=2,
+        prefill_chunk_size=3,
+        capture_layers=(0,),
+    )
+
+    assert FULL_CONTEXT_REPLAY_SOURCE_PROTOCOL.endswith("posthoc_block_cut_v2")
+    assert observed == [
+        ((0, 1, 2), 0),
+        ((3, 4, 5), 3),
+        ((6, 7, 8), 6),
+        ((9,), 9),
+    ]
+    assert state.query_summary.tolist() == [8.5]
+    assert state.block_summaries[:, 0].tolist() == [0.5, 2.5, 4.5]
+    assert state.local_positions == (6, 7, 8, 9)
+    assert state.local_layer_kv[0][0].flatten().tolist() == [6.0, 7.0, 8.0, 9.0]
+    assert state.block_layer_kv[2][0][0].flatten().tolist() == [4.0, 5.0]
+    assert state.forward_calls == 4
+    assert state.forwarded_tokens == 10
 
 
 def test_qa_aggregate_reports_bootstrap_and_paired_quality_deltas():

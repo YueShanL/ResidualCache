@@ -85,15 +85,21 @@ QA without teacher forcing under these conditions:
 - `router_epsilon_<epsilon>`: the same local window augmented with the blocks
   selected by each cumulative missing-mass tolerance.
 
-Router-selected block K/V is captured by the same streaming pass at block
-eviction, retains the original logical positions, and augments only physical
-full-attention layers. The final query, candidate block summaries, and native
-local cache all come from that same pass; no window or selected block is
-recomputed after retrieval. Sliding-attention layers keep the native
-block-aligned 512-to-575-token local window during autoregressive generation.
-New training records this student-state protocol in the checkpoint. Evaluation
-also accepts legacy checkpoints so their compatibility can be measured, while
-reporting the checkpoint and evaluation protocols and whether they match.
+The fixed-point QA evaluation first performs one full-context prefill through
+the retrieval point. It then cuts the query summary, every candidate block
+summary, candidate block K/V, and the native local K/V suffix from that same
+causal trajectory. Router selection is therefore the only intervention at the
+fixed retrieval point: the prefix state is not degraded by pretending that no
+earlier retrieval occurred. Selected blocks retain their original logical
+positions and augment only physical full-attention layers. Sliding-attention
+layers keep the native block-aligned 512-to-575-token local window after the
+cut during autoregressive generation.
+
+Training and persisted aligned collections retain their independent streaming
+protocol. QA reports the collection, checkpoint, and full-context posthoc-cut
+protocols separately and marks whether the checkpoint protocol matches the QA
+router-state source; legacy and streaming checkpoints remain loadable for
+controlled compatibility measurements.
 The report includes exact match, token F1, answer containment,
 95% bootstrap intervals, paired deltas against all three baselines, evidence
 block recall, retained teacher/predicted mass, selected-block fraction, and a
