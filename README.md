@@ -23,6 +23,13 @@ target fact better than chance.
   denominator and global cumulative-mass retrieval without changing the legacy
   router. Its checkpoint-only HPC evaluator supports configurable missing mass
   and an optional hard retrieval-block limit without invoking training.
+- `output_preserving_region_router/`: independent end-to-end successor. It
+  maps each restricted-stream query to one learned diagonal-Gaussian region in
+  block-key space and trains the region directly from frozen-model future
+  logits. Soft block gates are injected only into historical full-attention
+  K/V during training; hard evaluation physically packs only blocks inside the
+  region and includes autoregressive QA. No teacher-attention label or legacy
+  router mode is used. See `output_preserving_region_router/README.md`.
 - `cluster_router_bridge/`: independent integration which splits blocks,
   transports learned keys into memory-owned record metadata, invokes the
   memory-owned per-leaf router-vMF index, and packs selected clusters into
